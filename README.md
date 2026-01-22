@@ -1,59 +1,71 @@
-# Weight-Tied ECNet for CIFAR-10
+# Weight-Tied ECNet
 
-A minimal implementation of a weight-tied Expansion-Contraction CNN trained on CIFAR-10.
+A parameter-efficient CNN that reuses the same convolutional block multiple times, trained on CIFAR-10.
 
-## Key Idea
+## What is this?
 
-Traditional CNNs have separate weights for each layer. This network **reuses the same block** multiple times with different dilation rates, dramatically reducing parameters while maintaining expressiveness.
+Most CNNs stack many different layers, each with their own weights. This network takes a different approach: **one block, used repeatedly**.
+
+The trick: each time the block is reused, it processes the image at a different scale (via dilation). This captures both fine details and broad context without adding parameters.
 
 ```
-Input -> Stem -> [ECBlock x N] -> Global Pool -> Classifier
-                    ^
-                    |
-            Same weights reused N times
-            with different dilations
+Image → Stem → Block → Block → Block → ... → Classifier
+                 ↑________↑________↑
+                   Same weights!
+                   Different scales
 ```
 
-## Architecture Components
+**Result**: ~115K parameters (vs millions in typical CNNs) while still achieving competitive accuracy.
 
-| Component | Purpose |
-|-----------|---------|
-| **ECBlock** | Expand (1x1) -> Depthwise 3x3 -> Contract (1x1) with residual |
-| **DivisiveNorm** | Biologically-inspired local gain control |
-| **BlurPool** | Anti-aliased downsampling to improve shift invariance |
-| **Weight Tying** | Same block applied N times with dilation schedule [1,1,2,1,2,3] |
-
-## Usage
+## Quick Start
 
 ```bash
-# Install dependencies
-pip install -r requirements.txt
-
-# Train with defaults
+pip install torch torchvision
 python train.py
+```
 
-# Custom configuration
+CIFAR-10 downloads automatically. Training logs accuracy each epoch and saves the best model.
+
+## Configuration
+
+```bash
 python train.py --channels 96 --iterations 8 --epochs 300
 ```
 
-## Arguments
-
-| Arg | Default | Description |
-|-----|---------|-------------|
+| Option | Default | What it does |
+|--------|---------|--------------|
+| `--channels` | 64 | Width of the network (more = bigger model) |
+| `--iterations` | 6 | How many times to reuse the block |
+| `--expansion` | 4 | Internal expansion factor in each block |
 | `--epochs` | 200 | Training epochs |
 | `--batch-size` | 128 | Batch size |
-| `--lr` | 0.1 | Learning rate |
-| `--channels` | 64 | Base channel width |
-| `--iterations` | 6 | Number of block reuses |
-| `--expansion` | 4 | Expansion ratio in ECBlock |
+| `--lr` | 0.1 | Initial learning rate |
+
+## How it works
+
+**The Block (ECBlock)**: Expand → Process → Contract
+1. Expand channels with 1x1 conv
+2. Apply 3x3 depthwise conv with configurable dilation
+3. Contract back to original channels
+4. Add residual connection
+
+**Dilation Schedule**: `[1, 1, 2, 1, 2, 3]`
+- Early iterations use dilation=1 (local features)
+- Later iterations use dilation=2,3 (larger receptive field)
+
+**Other components**:
+- *DivisiveNorm*: Normalizes by local neighborhood magnitude (inspired by visual cortex)
+- *BlurPool*: Anti-aliased downsampling for better shift invariance
 
 ## Files
 
-- `model.py` - ECTiedNet architecture
-- `train.py` - Training script with CIFAR-10
-- `requirements.txt` - Dependencies
+| File | Description |
+|------|-------------|
+| `model.py` | Network architecture (ECTiedNet, ECBlock, etc.) |
+| `train.py` | Training loop with CIFAR-10 |
+| `requirements.txt` | Dependencies |
 
 ## References
 
-- BlurPool: [Making Convolutional Networks Shift-Invariant Again](https://arxiv.org/abs/1904.11486)
-- Divisive Normalization: Inspired by visual cortex gain control mechanisms
+- [Making Convolutional Networks Shift-Invariant Again](https://arxiv.org/abs/1904.11486) (BlurPool)
+- Divisive normalization is inspired by gain control mechanisms in biological vision
