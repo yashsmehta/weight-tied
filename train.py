@@ -6,11 +6,13 @@ Usage:
     python train.py --channels 96 --lr 0.05  # Custom config
 """
 import argparse
+import json
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
 
 from model import ECTiedNet, count_parameters
 
@@ -145,10 +147,17 @@ def main():
 
     # Training loop
     best_acc = 0
+    history = {"train_loss": [], "test_loss": [], "train_acc": [], "test_acc": []}
+
     for epoch in range(args.epochs):
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         scheduler.step()
+
+        history["train_loss"].append(train_loss)
+        history["test_loss"].append(test_loss)
+        history["train_acc"].append(train_acc)
+        history["test_acc"].append(test_acc)
 
         # Save best model
         if test_acc > best_acc:
@@ -161,6 +170,34 @@ def main():
               f"Best: {best_acc:.2f}%")
 
     print(f"\nDone. Best accuracy: {best_acc:.2f}%")
+
+    # Save history to JSON for later use
+    with open("history.json", "w") as f:
+        json.dump(history, f)
+
+    # Plot training curves
+    epochs = range(1, len(history["train_acc"]) + 1)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
+
+    ax1.plot(epochs, history["train_acc"], label="Train")
+    ax1.plot(epochs, history["test_acc"], label="Test")
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Accuracy (%)")
+    ax1.set_title("Accuracy over Epochs")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    ax2.plot(epochs, history["train_loss"], label="Train")
+    ax2.plot(epochs, history["test_loss"], label="Test")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Loss")
+    ax2.set_title("Loss over Epochs")
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    plt.savefig("training_curves.png", dpi=150, bbox_inches="tight")
+    print("Saved training_curves.png and history.json")
 
 
 if __name__ == "__main__":
