@@ -163,7 +163,7 @@ def main():
         # Save best model
         if test_acc > best_acc:
             best_acc = test_acc
-            torch.save(model.state_dict(), 'best_model.pth')
+            torch.save(model.state_dict(), f'best_model_depth{args.iterations}.pth')
 
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
               f"Train: {train_loss:.4f} / {train_acc:.2f}% | "
@@ -173,7 +173,7 @@ def main():
     print(f"\nDone. Best accuracy: {best_acc:.2f}%")
 
     # Save history to JSON for later use
-    with open("history.json", "w") as f:
+    with open(f"history_depth{args.iterations}.json", "w") as f:
         json.dump(history, f)
 
     # Plot training curves
@@ -197,8 +197,8 @@ def main():
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    plt.savefig("training_curves.png", dpi=150, bbox_inches="tight")
-    print("Saved training_curves.png and history.json")
+    plt.savefig(f"training_curves_depth{args.iterations}.png", dpi=150, bbox_inches="tight")
+    print(f"Saved training_curves_depth{args.iterations}.png and history_depth{args.iterations}.json")
 
 
 if __name__ == "__main__":
