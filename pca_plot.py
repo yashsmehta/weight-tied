@@ -2,7 +2,7 @@
 Extract final-layer activations from trained ECTiedNet models and plot 2D PCA.
 
 Usage:
-    python pca_plot.py  # Plots PCA for depths 2, 4, 8 (expects trained models)
+    python pca_plot.py  # Plots PCA for depths 2, 4, 6 (expects trained models)
 """
 import torch
 import numpy as np
@@ -58,7 +58,7 @@ def extract_activations(model, loader, device):
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     test_loader = get_test_loader()
-    depths = [2, 4, 8]
+    depths = [2, 4, 6]
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
