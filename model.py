@@ -171,8 +171,9 @@ class ECTiedNet(nn.Module):
         # Classification head
         self.head = nn.Linear(channels, num_classes)
 
-        # Dilation schedule for multi-scale processing
-        self.dilations = (dilations or [1, 1, 2, 1, 2, 3])[:num_iterations]
+        # Dilation schedule for multi-scale processing (cycles if more iterations than entries)
+        base_dilations = dilations or [1, 1, 2, 1, 2, 3]
+        self.dilations = [base_dilations[t % len(base_dilations)] for t in range(num_iterations)]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)  # [B, C, 32, 32]
