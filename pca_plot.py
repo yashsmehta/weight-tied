@@ -7,6 +7,7 @@ Usage:
 import torch
 import numpy as np
 from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score, calinski_harabasz_score
 import matplotlib.pyplot as plt
 from torchvision import datasets, transforms
 from torch.utils.data import DataLoader
@@ -74,11 +75,15 @@ def main():
         pca = PCA(n_components=2)
         coords = pca.fit_transform(activations)
 
+        sil = silhouette_score(activations, labels)
+        ch = calinski_harabasz_score(activations, labels)
+        print(f"  Depth {depth} — Silhouette: {sil:.3f}, Calinski-Harabasz: {ch:.1f}")
+
         for class_idx in range(10):
             mask = labels == class_idx
             ax.scatter(coords[mask, 0], coords[mask, 1], s=5, alpha=0.5, label=CIFAR10_CLASSES[class_idx])
 
-        ax.set_title(f"Depth {depth}")
+        ax.set_title(f"Depth {depth}\nSilhouette: {sil:.3f} | CH: {ch:.1f}")
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
         ax.legend(markerscale=3, fontsize=7, loc="best")
