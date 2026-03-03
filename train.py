@@ -2,8 +2,12 @@
 Training script for ECTiedNet on CIFAR-10.
 
 Usage:
-    python train.py                          # Train with defaults
-    python train.py --channels 96 --lr 0.05  # Custom config
+    python train.py                                        # Train with defaults
+    python train.py --channels 96 --lr 0.05               # Custom config
+    python train.py --dilations 1 1 1 1 1 1               # No dilation (ablation)
+    python train.py --dilations 1 2 3 1 2 3               # Cycling (ablation)
+    python train.py --dilations 3 2 1 2 1 1               # Reversed (ablation)
+    python train.py --resume checkpoint_depth6_dil1-1-2-1-2-3.pth  # Resume
 """
 import argparse
 import json
@@ -122,12 +126,23 @@ def main():
     parser.add_argument('--iterations', type=int, default=6, help='Block reuse count')
     parser.add_argument('--expansion', type=int, default=4, help='Expansion ratio')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--dilations', type=int, nargs='+', default=None,
+                        help='Dilation schedule e.g. --dilations 1 1 2 1 2 3')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='Path to checkpoint file to resume training from')
+    parser.add_argument('--checkpoint-every', type=int, default=10,
+                        help='Save a resumable checkpoint every N epochs (default: 10)')
     args = parser.parse_args()
+
+    # Build a run name that uniquely identifies this config across all output files
+    dil_str = '-'.join(map(str, args.dilations)) if args.dilations else '1-1-2-1-2-3'
+    run_name = f"depth{args.iterations}_dil{dil_str}"
 
     # Setup
     torch.manual_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Device: {device}")
+    print(f"Run:    {run_name}")
 
     # Data
     train_loader, test_loader = get_dataloaders(args.batch_size)
@@ -138,19 +153,34 @@ def main():
         channels=args.channels,
         expansion=args.expansion,
         num_iterations=args.iterations,
+        dilations=args.dilations,
     ).to(device)
     print(f"Parameters: {count_parameters(model):,}")
+    print(f"Dilations:  {model.dilations}")
 
     # Loss, optimizer, scheduler
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
-    # Training loop
-    best_acc = 0
+    # Training state — overwritten below if resuming
+    start_epoch = 0
+    best_acc = 0.0
     history = {"train_loss": [], "test_loss": [], "train_acc": [], "test_acc": []}
 
-    for epoch in range(args.epochs):
+    # Resume from checkpoint if requested
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location=device)
+        model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        scheduler.load_state_dict(checkpoint['scheduler'])
+        start_epoch = checkpoint['epoch'] + 1
+        best_acc = checkpoint['best_acc']
+        history = checkpoint['history']
+        print(f"Resumed from epoch {start_epoch}/{args.epochs}, best acc so far: {best_acc:.2f}%")
+
+    # Training loop
+    for epoch in range(start_epoch, args.epochs):
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         scheduler.step()
@@ -163,7 +193,18 @@ def main():
         # Save best model
         if test_acc > best_acc:
             best_acc = test_acc
-            torch.save(model.state_dict(), f'best_model_depth{args.iterations}.pth')
+            torch.save(model.state_dict(), f'best_model_{run_name}.pth')
+
+        # Save resumable checkpoint every N epochs
+        if (epoch + 1) % args.checkpoint_every == 0:
+            torch.save({
+                'epoch': epoch,
+                'model': model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'best_acc': best_acc,
+                'history': history,
+            }, f'checkpoint_{run_name}.pth')
 
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
               f"Train: {train_loss:.4f} / {train_acc:.2f}% | "
@@ -173,7 +214,7 @@ def main():
     print(f"\nDone. Best accuracy: {best_acc:.2f}%")
 
     # Save history to JSON for later use
-    with open(f"history_depth{args.iterations}.json", "w") as f:
+    with open(f"history_{run_name}.json", "w") as f:
         json.dump(history, f)
 
     # Plot training curves
@@ -184,7 +225,7 @@ def main():
     ax1.plot(epochs, history["test_acc"], label="Test")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Accuracy (%)")
-    ax1.set_title("Accuracy over Epochs")
+    ax1.set_title(f"Accuracy — {run_name}")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
@@ -192,13 +233,13 @@ def main():
     ax2.plot(epochs, history["test_loss"], label="Test")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Loss")
-    ax2.set_title("Loss over Epochs")
+    ax2.set_title(f"Loss — {run_name}")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
     fig.tight_layout()
-    plt.savefig(f"training_curves_depth{args.iterations}.png", dpi=150, bbox_inches="tight")
-    print(f"Saved training_curves_depth{args.iterations}.png and history_depth{args.iterations}.json")
+    plt.savefig(f"training_curves_{run_name}.png", dpi=150, bbox_inches="tight")
+    print(f"Saved training_curves_{run_name}.png and history_{run_name}.json")
 
 
 if __name__ == "__main__":
