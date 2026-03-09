@@ -162,6 +162,10 @@ def main():
     optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
+    # Snapshot weights at initialization for distribution comparison
+    init_weights = {name: param.detach().cpu().clone()
+                    for name, param in model.named_parameters() if param.requires_grad}
+
     # Training state — overwritten below if resuming
     start_epoch = 0
     best_acc = 0.0
@@ -239,6 +243,27 @@ def main():
     fig.tight_layout()
     plt.savefig(f"training_curves_{run_name}.png", dpi=150, bbox_inches="tight")
     print(f"Saved training_curves_{run_name}.png and history_{run_name}.json")
+
+    # Plot weight distributions: init vs final
+    final_weights = {name: param.detach().cpu()
+                     for name, param in model.named_parameters() if param.requires_grad}
+    param_names = list(init_weights.keys())
+    n = len(param_names)
+    fig2, axes = plt.subplots(n, 1, figsize=(8, 3 * n))
+    if n == 1:
+        axes = [axes]
+    for ax, name in zip(axes, param_names):
+        ax.hist(init_weights[name].numpy().ravel(), bins=60, alpha=0.6, label="Init", density=True)
+        ax.hist(final_weights[name].numpy().ravel(), bins=60, alpha=0.6, label="Trained", density=True)
+        ax.set_title(name)
+        ax.set_xlabel("Weight value")
+        ax.set_ylabel("Density")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+    fig2.suptitle(f"Weight distributions — {run_name}", fontsize=13)
+    fig2.tight_layout()
+    plt.savefig(f"weight_distributions_{run_name}.png", dpi=150, bbox_inches="tight")
+    print(f"Saved weight_distributions_{run_name}.png")
 
 
 if __name__ == "__main__":
