@@ -84,7 +84,6 @@ def train_epoch(model, loader, optimizer, criterion, device):
         outputs = model(inputs)
         loss = criterion(outputs, targets)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         # Track metrics
@@ -121,7 +120,7 @@ def main():
     parser = argparse.ArgumentParser(description='Train ECTiedNet on CIFAR-10')
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch-size', type=int, default=128)
-    parser.add_argument('--lr', type=float, default=0.01)
+    parser.add_argument('--lr', type=float, default=0.05)
     parser.add_argument('--channels', type=int, default=64, help='Base channel width')
     parser.add_argument('--iterations', type=int, default=6, help='Block reuse count')
     parser.add_argument('--expansion', type=int, default=4, help='Expansion ratio')
