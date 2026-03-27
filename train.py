@@ -11,61 +11,19 @@ Usage:
 """
 import argparse
 import json
+import time
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
 import matplotlib.pyplot as plt
 
 from model import ECTiedNet, count_parameters
+from imagenet_mini_dataloader import get_dataloaders
 
-
-# ============================================================================
-# Data Loading
-# ============================================================================
-
-def get_dataloaders(batch_size: int = 128, num_workers: int = 2):
-    """
-    Create CIFAR-10 train/test dataloaders with standard augmentation.
-
-    Train augmentation: RandomCrop + HorizontalFlip
-    Test: Just normalize (no augmentation)
-    """
-    # CIFAR-10 channel-wise mean and std
-    mean = (0.4914, 0.4822, 0.4465)
-    std = (0.2470, 0.2435, 0.2616)
-
-    train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),  # Random crop with padding
-        transforms.RandomHorizontalFlip(),      # 50% chance flip
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
-
-    test_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
-
-    # Download CIFAR-10 if not present
-    train_dataset = datasets.CIFAR10(
-        root='./data', train=True, download=True, transform=train_transform
-    )
-    test_dataset = datasets.CIFAR10(
-        root='./data', train=False, download=True, transform=test_transform
-    )
-
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True
-    )
-    test_loader = DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False,
-        num_workers=num_workers, pin_memory=True
-    )
-
-    return train_loader, test_loader
+DATASET_NUM_CLASSES = {
+    "cifar10": 10,
+    "imagenet-mini-50": 1000,
+}
 
 
 # ============================================================================
@@ -117,7 +75,9 @@ def evaluate(model, loader, criterion, device):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Train ECTiedNet on CIFAR-10')
+    parser = argparse.ArgumentParser(description='Train ECTiedNet')
+    parser.add_argument('--dataset', default='cifar10', choices=list(DATASET_NUM_CLASSES),
+                        help='Dataset to train on (default: cifar10)')
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=0.05)
@@ -135,7 +95,7 @@ def main():
 
     # Build a run name that uniquely identifies this config across all output files
     dil_str = '-'.join(map(str, args.dilations)) if args.dilations else '1-1-2-1-2-3'
-    run_name = f"depth{args.iterations}_dil{dil_str}"
+    run_name = f"{args.dataset}_depth{args.iterations}_dil{dil_str}"
 
     # Setup
     torch.manual_seed(args.seed)
@@ -144,11 +104,13 @@ def main():
     print(f"Run:    {run_name}")
 
     # Data
-    train_loader, test_loader = get_dataloaders(args.batch_size)
+    train_loader, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size)
+    num_classes = DATASET_NUM_CLASSES[args.dataset]
+    print(f"Dataset: {args.dataset} ({num_classes} classes)")
 
     # Model
     model = ECTiedNet(
-        num_classes=10,
+        num_classes=num_classes,
         channels=args.channels,
         expansion=args.expansion,
         num_iterations=args.iterations,
@@ -169,7 +131,7 @@ def main():
     # Training state — overwritten below if resuming
     start_epoch = 0
     best_acc = 0.0
-    history = {"train_loss": [], "test_loss": [], "train_acc": [], "test_acc": []}
+    history = {"train_loss": [], "test_loss": [], "train_acc": [], "test_acc": [], "epoch_time": []}
 
     # Resume from checkpoint if requested
     if args.resume:
@@ -184,14 +146,17 @@ def main():
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
+        t0 = time.time()
         train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         scheduler.step()
+        epoch_time = time.time() - t0
 
         history["train_loss"].append(train_loss)
         history["test_loss"].append(test_loss)
         history["train_acc"].append(train_acc)
         history["test_acc"].append(test_acc)
+        history["epoch_time"].append(epoch_time)
 
         # Save best model
         if test_acc > best_acc:
@@ -212,7 +177,8 @@ def main():
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
               f"Train: {train_loss:.4f} / {train_acc:.2f}% | "
               f"Test: {test_loss:.4f} / {test_acc:.2f}% | "
-              f"Best: {best_acc:.2f}%")
+              f"Best: {best_acc:.2f}% | "
+              f"Time: {epoch_time:.1f}s")
 
     print(f"\nDone. Best accuracy: {best_acc:.2f}%")
 
