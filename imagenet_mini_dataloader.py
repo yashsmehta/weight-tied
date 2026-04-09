@@ -28,7 +28,7 @@ from torchvision import datasets, transforms
 
 # ---------- paths (edit these for your setup) ----------
 IMAGENET_DATA_DIR = "/data/shared/datasets/imagenet-mini-50"
-FOLDER_LABELS = "/home/ymehta3/research/VisionAI/visreps/datasets/obj_cls/imagenet/folder_labels.json"
+FOLDER_LABELS = "/home/rsingh55/folder_labels.json"
 CIFAR10_DATA_DIR = "./data"
 
 # ---------- normalization constants ----------
