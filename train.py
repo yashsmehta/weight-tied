@@ -81,6 +81,10 @@ def main():
     parser.add_argument('--epochs', type=int, default=200)
     parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=0.05)
+    parser.add_argument('--optimizer', default='adamw', choices=['sgd', 'adamw'],
+                        help='Optimizer to use (default: adamw)')
+    parser.add_argument('--weight-decay', type=float, default=0.01,
+                        help='Weight decay (default: 0.01 for adamw, 5e-4 for sgd)')
     parser.add_argument('--channels', type=int, default=64, help='Base channel width')
     parser.add_argument('--iterations', type=int, default=6, help='Block reuse count')
     parser.add_argument('--expansion', type=int, default=4, help='Expansion ratio')
@@ -95,13 +99,15 @@ def main():
 
     # Build a run name that uniquely identifies this config across all output files
     dil_str = '-'.join(map(str, args.dilations)) if args.dilations else '1-1-2-1-2-3'
-    run_name = f"{args.dataset}_depth{args.iterations}_dil{dil_str}"
+    lr_str = f"{args.lr:.0e}".replace('-0', '-').replace('+0', '')
+    run_name = f"{args.dataset}_depth{args.iterations}_dil{dil_str}_{args.optimizer}_lr{lr_str}"
 
     # Setup
     torch.manual_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device: {device}")
-    print(f"Run:    {run_name}")
+    print(f"Device:    {device}")
+    print(f"Run:       {run_name}")
+    print(f"Optimizer: {args.optimizer}, lr={args.lr}, wd={args.weight_decay}")
 
     # Data
     train_loader, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size)
@@ -121,7 +127,11 @@ def main():
 
     # Loss, optimizer, scheduler
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    if args.optimizer == 'adamw':
+        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    else:
+        wd = args.weight_decay if args.weight_decay != 0.01 else 5e-4
+        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=wd)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # Snapshot weights at initialization for distribution comparison
