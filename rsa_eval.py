@@ -26,7 +26,7 @@ from scipy import stats
 from model import ECTiedNet
 from imagenet_mini_dataloader import get_dataloaders
 
-DATASET_NUM_CLASSES = {"cifar10": 10, "imagenet-mini-50": 1000}
+DATASET_NUM_CLASSES = {"cifar10": 10, "imagenet-mini-50": 1000, "imagenet": 1000}
 
 
 # ---------------------------------------------------------------------------

@@ -27,9 +27,10 @@ from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 
 # ---------- paths (edit these for your setup) ----------
-IMAGENET_DATA_DIR = "/data/shared/datasets/imagenet-mini-50"
-FOLDER_LABELS = "/home/rsingh55/folder_labels.json"
-CIFAR10_DATA_DIR = "./data"
+IMAGENET_MINI50_DATA_DIR = "/data/shared/datasets/imagenet-mini-50"
+IMAGENET_DATA_DIR        = "/data/shared/datasets/imagenet"
+FOLDER_LABELS            = "/home/rsingh55/folder_labels.json"
+CIFAR10_DATA_DIR         = "./data"
 
 # ---------- normalization constants ----------
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -87,6 +88,49 @@ class ImageNetMini50(Dataset):
 
         # Collect all (path, label) tuples
         samples = []
+        for folder in sorted(os.listdir(IMAGENET_MINI50_DATA_DIR)):
+            if folder not in folder_labels:
+                continue
+            label = int(folder_labels[folder])
+            folder_path = os.path.join(IMAGENET_MINI50_DATA_DIR, folder)
+            for fname in sorted(os.listdir(folder_path)):
+                if fname.lower().endswith((".jpeg", ".jpg")):
+                    samples.append((os.path.join(folder_path, fname), label))
+
+        # Deterministic split (seed=42) — matches the visreps training pipeline
+        if split in ("train", "test"):
+            g = torch.Generator().manual_seed(42)
+            indices = torch.randperm(len(samples), generator=g).tolist()
+            cut = int(len(samples) * train_ratio)
+            indices = indices[:cut] if split == "train" else indices[cut:]
+            samples = [samples[i] for i in indices]
+
+        self.samples = samples
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        path, label = self.samples[idx]
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            img = Image.open(path).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+
+class ImageNet(Dataset):
+    """Full ImageNet: 1000 classes × ~1200 images, with deterministic 80/20 split."""
+
+    def __init__(self, split="train", transform=None, train_ratio=0.8):
+        assert split in ("train", "test", "all")
+        self.transform = transform
+
+        with open(FOLDER_LABELS) as f:
+            folder_labels = json.load(f)
+
+        samples = []
         for folder in sorted(os.listdir(IMAGENET_DATA_DIR)):
             if folder not in folder_labels:
                 continue
@@ -96,7 +140,6 @@ class ImageNetMini50(Dataset):
                 if fname.lower().endswith((".jpeg", ".jpg")):
                     samples.append((os.path.join(folder_path, fname), label))
 
-        # Deterministic split (seed=42) — matches the visreps training pipeline
         if split in ("train", "test"):
             g = torch.Generator().manual_seed(42)
             indices = torch.randperm(len(samples), generator=g).tolist()
@@ -134,6 +177,11 @@ def get_dataloaders(dataset="imagenet-mini-50", batch_size=64, num_workers=4, im
         size = image_size or 224
         train_ds = ImageNetMini50("train", _imagenet_train_transform(size))
         test_ds  = ImageNetMini50("test",  _imagenet_val_transform(size))
+
+    elif dataset == "imagenet":
+        size = image_size or 224
+        train_ds = ImageNet("train", _imagenet_train_transform(size))
+        test_ds  = ImageNet("test",  _imagenet_val_transform(size))
 
     elif dataset == "cifar10":
         size = image_size or 32

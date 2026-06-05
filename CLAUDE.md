@@ -59,12 +59,23 @@ python train.py --resume checkpoint_depth6_dil1-1-2-1-2-3.pth
 Checkpoint saves model, optimizer, scheduler, epoch, best_acc, and full history.
 Resumes from the next epoch with LR schedule intact.
 
+## Datasets
+| Dataset | Classes | Images/class | Path (server) |
+|---|---|---|---|
+| `cifar10` | 10 | 5000 train / 1000 test | auto-downloaded |
+| `imagenet-mini-50` | 1000 | 50 | `/data/shared/datasets/imagenet-mini-50` |
+| `imagenet` | 1000 | ~1200 | `/data/shared/datasets/imagenet` |
+
+All ImageNet datasets use `/home/rsingh55/folder_labels.json` to map folder names (WordNet IDs) to integer labels. ImageNet-mini-50 and ImageNet use a deterministic 80/20 train/test split (seed=42).
+
 ## File layout
 - `model.py` — ECTiedNet, ECBlock, DivisiveNorm, BlurPool
 - `train.py` — CLI training script
+- `imagenet_mini_dataloader.py` — dataloader for all three datasets
+- `rsa_eval.py` — RSA brain-model alignment evaluation
 - `weight_tied_ecnet.ipynb` — interactive notebook (mirrors train.py)
 - `data/` — CIFAR-10 (auto-downloaded)
 
 ## Environment
 - macOS, typically runs on CPU locally (use Colab for GPU)
-- Dependencies: torch, torchvision, matplotlib
+- Dependencies: torch, torchvision, matplotlib, scipy
