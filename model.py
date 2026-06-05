@@ -175,19 +175,17 @@ class ECTiedNet(nn.Module):
         base_dilations = dilations or [1, 1, 2, 1, 2, 3]
         self.dilations = [base_dilations[t % len(base_dilations)] for t in range(num_iterations)]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)  # [B, C, 32, 32]
-
+    def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Pre-classifier representation (post-GAP). Used for RSA analysis."""
+        x = self.stem(x)
         for t in range(self.num_iterations):
-            # Reuse same block with different dilation
             x = self.block(x, dilation=self.dilations[t])
-
-            # Downsample halfway through
             if t == (self.num_iterations // 2) - 1:
-                x = self.blur(x)  # [B, C, 16, 16]
+                x = self.blur(x)
+        return x.mean(dim=(2, 3))  # [B, channels]
 
-        x = x.mean(dim=(2, 3))  # Global average pooling -> [B, C]
-        return self.head(x)     # [B, num_classes]
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.head(self.extract_features(x))
 
 
 # ============================================================================
