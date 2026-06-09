@@ -4,7 +4,8 @@
 Parameter-efficient CNN that reuses one convolutional block (ECBlock) multiple times with different dilation rates, trained on CIFAR-10. ~115K parameters.
 
 ## Architecture
-- Stem (3x3 conv) -> ECBlock x6 (weight-tied, varying dilation) -> BlurPool -> GAP -> Linear
+- Stem (stride-4: two 3x3 stride-2 convs) -> ECBlock x6 (weight-tied, varying dilation) -> BlurPool -> GAP -> Linear
+- Stem reduces resolution 4x before any ECBlock processing: ImageNet 224x224 → 56x56; CIFAR-10 32x32 → 8x8
 - Dilation schedule: [1, 1, 2, 1, 2, 3]
 - Uses DivisiveNorm (bio-inspired) and BlurPool (anti-aliased downsampling)
 

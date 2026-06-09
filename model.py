@@ -131,14 +131,17 @@ class ECBlock(nn.Module):
 
 class ECTiedNet(nn.Module):
     """
-    Weight-Tied Expansion-Contraction Network for CIFAR-10.
+    Weight-Tied Expansion-Contraction Network.
 
     Architecture:
-        Stem (3x3) -> [ECBlock x N with dilations] -> BlurPool -> GAP -> Linear
+        Stem (stride-4) -> [ECBlock x N with dilations] -> BlurPool -> GAP -> Linear
 
     The core idea is weight tying: ONE ECBlock is instantiated and reused
     N times. Different dilation rates at each iteration give varying
     receptive fields without adding parameters.
+
+    Stem reduces spatial resolution by 4x before any ECBlock processing:
+        ImageNet 224x224 → 56x56; CIFAR-10 32x32 → 8x8
 
     Default dilation schedule: [1, 1, 2, 1, 2, 3]
     - Early iterations: local features (dilation=1)
@@ -155,9 +158,13 @@ class ECTiedNet(nn.Module):
         super().__init__()
         self.num_iterations = num_iterations
 
-        # Stem: simple 3x3 for 32x32 images (no downsampling)
+        # Stride-4 stem: two 3x3 stride-2 convs
+        # ImageNet 224x224 → 56x56; CIFAR 32x32 → 8x8
         self.stem = nn.Sequential(
-            nn.Conv2d(3, channels, 3, padding=1, bias=False),
+            nn.Conv2d(3, channels, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(gn_groups(channels), channels),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(channels, channels, 3, stride=2, padding=1, bias=False),
             nn.GroupNorm(gn_groups(channels), channels),
             nn.SiLU(inplace=True),
         )
