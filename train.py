@@ -1,13 +1,14 @@
 """
-Training script for ECTiedNet on CIFAR-10.
+Training script for ECTiedNet.
 
 Usage:
-    python train.py                                        # Train with defaults
-    python train.py --channels 96 --lr 0.05               # Custom config
-    python train.py --dilations 1 1 1 1 1 1               # No dilation (ablation)
-    python train.py --dilations 1 2 3 1 2 3               # Cycling (ablation)
-    python train.py --dilations 3 2 1 2 1 1               # Reversed (ablation)
-    python train.py --resume checkpoint_depth6_dil1-1-2-1-2-3.pth  # Resume
+    python train.py --dataset imagenet                     # ImageNet with defaults
+    python train.py --dataset imagenet --lr 1e-3           # Custom LR
+    python train.py --stage-iterations 6 6 6               # Deeper (18 total iterations)
+    python train.py --channels 128                          # Explicit channel width
+    python train.py --dilations 1 1 1 1                    # No dilation (ablation)
+    python train.py --dilations 1 2 3 2                    # Default dilation schedule
+    python train.py --resume checkpoint_imagenet_iter4-4-4_dil1-2-3-2_adamw_lr1e-3.pth
 """
 import argparse
 import json
@@ -86,9 +87,12 @@ def main():
                         help='Optimizer to use (default: adamw)')
     parser.add_argument('--weight-decay', type=float, default=0.01,
                         help='Weight decay (default: 0.01 for adamw, 5e-4 for sgd)')
-    parser.add_argument('--channels', type=int, default=64, help='Base channel width')
-    parser.add_argument('--iterations', type=int, default=6, help='Block reuse count')
-    parser.add_argument('--expansion', type=int, default=4, help='Expansion ratio')
+    parser.add_argument('--channels', type=int, default=128,
+                        help='Channel width (single value, shared across all iterations, default: 128)')
+    parser.add_argument('--stage-iterations', type=int, nargs=3, default=[4, 4, 4],
+                        metavar=('N1', 'N2', 'N3'),
+                        help='ECBlock iterations per stage (default: 4 4 4 = 12 total)')
+    parser.add_argument('--expansion', type=int, default=4, help='Expansion ratio in ECBlock')
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--dilations', type=int, nargs='+', default=None,
                         help='Dilation schedule e.g. --dilations 1 1 2 1 2 3')
@@ -99,9 +103,10 @@ def main():
     args = parser.parse_args()
 
     # Build a run name that uniquely identifies this config across all output files
-    dil_str = '-'.join(map(str, args.dilations)) if args.dilations else '1-1-2-1-2-3'
+    dil_str = '-'.join(map(str, args.dilations)) if args.dilations else '1-2-3-2'
+    iters_str = '-'.join(map(str, args.stage_iterations))
     lr_str = f"{args.lr:.0e}".replace('-0', '-').replace('+0', '')
-    run_name = f"{args.dataset}_depth{args.iterations}_dil{dil_str}_{args.optimizer}_lr{lr_str}"
+    run_name = f"{args.dataset}_ch{args.channels}_iter{iters_str}_dil{dil_str}_{args.optimizer}_lr{lr_str}"
 
     # Setup
     torch.manual_seed(args.seed)
@@ -119,12 +124,14 @@ def main():
     model = ECTiedNet(
         num_classes=num_classes,
         channels=args.channels,
+        stage_iterations=tuple(args.stage_iterations),
         expansion=args.expansion,
-        num_iterations=args.iterations,
         dilations=args.dilations,
     ).to(device)
-    print(f"Parameters: {count_parameters(model):,}")
-    print(f"Dilations:  {model.dilations}")
+    print(f"Parameters:       {count_parameters(model):,}")
+    print(f"Channels:         {args.channels}")
+    print(f"Stage iterations: {args.stage_iterations} ({sum(args.stage_iterations)} total)")
+    print(f"Dilations:        {model.dilations}")
 
     # Loss, optimizer, scheduler
     criterion = nn.CrossEntropyLoss()

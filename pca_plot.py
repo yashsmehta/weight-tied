@@ -1,97 +1,136 @@
 """
-Extract final-layer activations from trained ECTiedNet models and plot 2D PCA.
+PCA of per-stage activations from a trained ECTiedNet.
+
+Plots three panels — Stage1 (V1), Stage2 (V4), Stage3 (IT) — to visualize
+how class separation improves across the ventral stream hierarchy.
+
+For ImageNet (1000 classes), pass --n-classes to show a readable subset.
 
 Usage:
-    python pca_plot.py  # Plots PCA for depths 2, 6, 10 (expects trained models)
+    python pca_plot.py --checkpoint best_model_imagenet_iter4-4-4_....pth
+    python pca_plot.py --checkpoint ... --dataset imagenet-mini-50 --n-classes 20
+    python pca_plot.py --checkpoint ... --dataset cifar10 --n-classes 10
 """
-import torch
+import argparse
 import numpy as np
+import torch
+import matplotlib.pyplot as plt
 from sklearn.decomposition import PCA
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
-import matplotlib.pyplot as plt
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
 
 from model import ECTiedNet
+from imagenet_mini_dataloader import get_dataloaders
 
-CIFAR10_CLASSES = [
-    "airplane", "automobile", "bird", "cat", "deer",
-    "dog", "frog", "horse", "ship", "truck",
-]
-
-
-def get_test_loader(batch_size=256):
-    mean = (0.4914, 0.4822, 0.4465)
-    std = (0.2470, 0.2435, 0.2616)
-    test_transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize(mean, std),
-    ])
-    test_dataset = datasets.CIFAR10(
-        root="./data", train=False, download=True, transform=test_transform
-    )
-    return DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=2)
+STAGE_LABELS = ["Stage 1 (V1)", "Stage 2 (V4)", "Stage 3 (IT)"]
 
 
 @torch.no_grad()
-def extract_activations(model, loader, device):
-    """Extract activations after GAP (input to final linear layer)."""
+def extract_all_stage_features(model, loader, device):
+    """Extract per-stage post-GAP features for the full dataset.
+
+    Returns:
+        stage_feats: list of 3 numpy arrays, each (N, C_stage)
+        labels:      (N,) numpy array
+    """
     model.eval()
-    all_activations = []
-    all_labels = []
-
-    for inputs, targets in loader:
-        inputs = inputs.to(device)
-        # Forward through stem + blocks + blur (everything before head)
-        x = model.stem(inputs)
-        for t in range(model.num_iterations):
-            x = model.block(x, dilation=model.dilations[t])
-            if t == (model.num_iterations // 2) - 1:
-                x = model.blur(x)
-        x = x.mean(dim=(2, 3))  # GAP -> these are the final-layer activations
-
-        all_activations.append(x.cpu().numpy())
-        all_labels.append(targets.numpy())
-
-    return np.concatenate(all_activations), np.concatenate(all_labels)
+    stage_bufs = [[] for _ in range(3)]
+    label_buf  = []
+    for imgs, lbls in loader:
+        per_stage = model.extract_stage_features(imgs.to(device))
+        for i, feat in enumerate(per_stage):
+            stage_bufs[i].append(feat.cpu().numpy())
+        label_buf.append(lbls.numpy())
+    labels = np.concatenate(label_buf)
+    stage_feats = [np.concatenate(buf) for buf in stage_bufs]
+    return stage_feats, labels
 
 
 def main():
+    parser = argparse.ArgumentParser(description="PCA of ECTiedNet stage activations")
+    parser.add_argument("--checkpoint", required=True,
+                        help="Path to best_model_*.pth or checkpoint_*.pth")
+    parser.add_argument("--dataset", default="imagenet",
+                        choices=["imagenet", "imagenet-mini-50", "cifar10"])
+    parser.add_argument("--channels", type=int, default=128)
+    parser.add_argument("--stage-iterations", type=int, nargs=3, default=[4, 4, 4],
+                        metavar=("N1", "N2", "N3"))
+    parser.add_argument("--expansion", type=int, default=4)
+    parser.add_argument("--dilations", type=int, nargs="+", default=None)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--n-classes", type=int, default=10,
+                        help="Number of classes to plot (randomly sampled; default: 10)")
+    parser.add_argument("--seed", type=int, default=42)
+    args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    test_loader = get_test_loader()
-    depths = [2, 6, 10]
+    print(f"Device: {device}")
+
+    num_classes = {"cifar10": 10, "imagenet-mini-50": 1000, "imagenet": 1000}[args.dataset]
+    model = ECTiedNet(
+        num_classes=num_classes,
+        channels=args.channels,
+        stage_iterations=tuple(args.stage_iterations),
+        expansion=args.expansion,
+        dilations=args.dilations,
+    ).to(device)
+
+    state = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    if "model" in state:
+        state = state["model"]
+    model.load_state_dict(state)
+    print(f"Loaded: {args.checkpoint}")
+
+    _, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size)
+    print(f"Extracting per-stage features from {len(test_loader.dataset)} images...")
+    stage_feats, labels = extract_all_stage_features(model, test_loader, device)
+    for i, (feats, label) in enumerate(zip(stage_feats, STAGE_LABELS)):
+        print(f"  {label}: {feats.shape}")
+
+    # Select which classes to plot
+    all_classes = np.unique(labels)
+    n_plot = min(args.n_classes, len(all_classes))
+    chosen = rng.choice(all_classes, size=n_plot, replace=False)
+    chosen.sort()
+    mask = np.isin(labels, chosen)
+    print(f"Plotting {n_plot} classes out of {len(all_classes)}: {chosen.tolist()}")
+
+    cmap = plt.cm.get_cmap("tab20", n_plot)
 
     fig, axes = plt.subplots(1, 3, figsize=(18, 5))
 
-    for ax, depth in zip(axes, depths):
-        model_path = f"best_model_depth{depth}.pth"
-        print(f"Loading {model_path}...")
+    for ax, feats, stage_label in zip(axes, stage_feats, STAGE_LABELS):
+        feats_sub  = feats[mask]
+        labels_sub = labels[mask]
 
-        model = ECTiedNet(num_classes=10, channels=64, expansion=4, num_iterations=depth).to(device)
-        model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
+        # Metrics on all samples (not just the plotted subset)
+        sil = silhouette_score(feats, labels, sample_size=min(5000, len(labels)),
+                               random_state=args.seed)
+        ch  = calinski_harabasz_score(feats, labels)
+        print(f"  {stage_label} — Silhouette: {sil:.3f}  Calinski-Harabasz: {ch:.1f}")
 
-        activations, labels = extract_activations(model, test_loader, device)
+        coords = PCA(n_components=2, random_state=args.seed).fit_transform(feats_sub)
 
-        pca = PCA(n_components=2)
-        coords = pca.fit_transform(activations)
+        for i, cls in enumerate(chosen):
+            m = labels_sub == cls
+            ax.scatter(coords[m, 0], coords[m, 1], s=6, alpha=0.6,
+                       color=cmap(i), label=str(cls))
 
-        sil = silhouette_score(activations, labels)
-        ch = calinski_harabasz_score(activations, labels)
-        print(f"  Depth {depth} — Silhouette: {sil:.3f}, Calinski-Harabasz: {ch:.1f}")
-
-        for class_idx in range(10):
-            mask = labels == class_idx
-            ax.scatter(coords[mask, 0], coords[mask, 1], s=5, alpha=0.5, label=CIFAR10_CLASSES[class_idx])
-
-        ax.set_title(f"Depth {depth}\nSilhouette: {sil:.3f} | CH: {ch:.1f}")
+        ax.set_title(f"{stage_label}\nSilhouette: {sil:.3f}  CH: {ch:.1f}", fontsize=10)
         ax.set_xlabel("PC1")
         ax.set_ylabel("PC2")
-        ax.legend(markerscale=3, fontsize=7, loc="best")
+        ax.legend(title="Class", markerscale=3, fontsize=6, loc="best",
+                  ncol=2 if n_plot > 10 else 1)
 
-    fig.suptitle("2D PCA of Final-Layer Activations by Depth", fontsize=14)
+    fig.suptitle(
+        "PCA of stage activations — class separation across ventral stream hierarchy",
+        fontsize=12,
+    )
     fig.tight_layout()
-    plt.savefig("pca_activations.png", dpi=150, bbox_inches="tight")
-    print("Saved pca_activations.png")
+    out = "pca_stages.png"
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    print(f"Saved {out}")
 
 
 if __name__ == "__main__":

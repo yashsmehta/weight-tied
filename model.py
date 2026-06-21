@@ -1,9 +1,20 @@
 """
-Weight-Tied ECNet for CIFAR-10
+Weight-Tied ECNet
 
-Key idea: Instead of having separate weights per layer, we reuse ONE block
-multiple times with different dilation rates. This reduces parameters while
-capturing multi-scale features through varying receptive fields.
+ONE shared ECBlock applied across three resolution levels.
+
+Spatial flow:
+    224 → stem → 56 → [N1 iters] → BlurPool → 28 → [N2 iters] → BlurPool
+        → 14 → [N3 iters] → BlurPool → 7 → GAP → head
+
+Total downsampling: 4 (stem) × 2 × 2 × 2 = 32×  →  7×7 before GAP.
+Theoretical receptive field: ~511px  >>  224px input (full image coverage).
+
+Default (~420K params): channels=128, stage_iterations=(4,4,4)
+Untied equivalent (unique weights per iteration): ~1.95M params  →  4.6× reduction.
+
+The single shared block is the core claim: one canonical circuit, applied
+iteratively at three spatial scales, recapitulates the ventral stream hierarchy.
 """
 import torch
 import torch.nn as nn
@@ -14,8 +25,8 @@ import torch.nn.functional as F
 # Utility
 # ============================================================================
 
-def gn_groups(channels: int, max_groups: int = 16) -> int:
-    """Find largest divisor of channels <= max_groups for GroupNorm."""
+def gn_groups(channels: int, max_groups: int = 32) -> int:
+    """Largest divisor of channels <= max_groups for GroupNorm."""
     for g in range(min(max_groups, channels), 0, -1):
         if channels % g == 0:
             return g
@@ -28,12 +39,8 @@ def gn_groups(channels: int, max_groups: int = 16) -> int:
 
 class DivisiveNorm(nn.Module):
     """
-    Biologically-inspired normalization mimicking visual cortex gain control.
-
-    Formula: y = x / (eps + local_avg(|x|))
-
-    This normalizes each activation by the average magnitude of its neighbors,
-    making the network more robust to contrast variations.
+    Biologically-inspired normalization (visual cortex gain control).
+    y = x / (eps + local_avg(|x|))   —   Carandini & Heeger 2012.
     """
     def __init__(self, kernel_size: int = 3, eps: float = 1e-3):
         super().__init__()
@@ -46,83 +53,64 @@ class DivisiveNorm(nn.Module):
 
 class BlurPool2d(nn.Module):
     """
-    Anti-aliased downsampling using a fixed low-pass filter.
-
-    Standard strided convolutions can cause aliasing artifacts. BlurPool
-    applies a blur before downsampling to preserve shift-invariance.
-
-    Uses binomial kernel [1,2,1] x [1,2,1] (normalized).
-    Reference: "Making Convolutional Networks Shift-Invariant Again"
+    Anti-aliased stride-2 downsampling (Zhang 2019).
+    Fixed binomial [1,2,1]×[1,2,1] kernel — no learned parameters.
+    Called three times in the network body (same instance, stateless).
     """
     def __init__(self, channels: int, stride: int = 2):
         super().__init__()
         self.stride = stride
-        self.groups = channels
-
-        # Create 2D binomial kernel via outer product
         k1d = torch.tensor([1., 2., 1.])
-        k2d = torch.einsum('i,j->ij', k1d, k1d)  # [1,2,1] x [1,2,1]
-        k2d = k2d / k2d.sum()  # Normalize to sum=1
-
-        # Shape: (channels, 1, 3, 3) for depthwise conv
+        k2d = torch.einsum('i,j->ij', k1d, k1d)
+        k2d /= k2d.sum()
         self.register_buffer('kernel', k2d[None, None].repeat(channels, 1, 1, 1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.conv2d(x, self.kernel, stride=self.stride, padding=1, groups=self.groups)
+        return F.conv2d(x, self.kernel, stride=self.stride, padding=1, groups=x.shape[1])
 
 
 class ECBlock(nn.Module):
     """
-    Expansion-Contraction block (inverted bottleneck with weight reuse).
+    Expansion-Contraction block — instantiated once, shared across all iterations.
 
-    Structure:
-        1. Expand:   1x1 conv (C -> C*expansion)
-        2. Process:  Depthwise 3x3 with configurable dilation
-        3. Contract: 1x1 conv (C*expansion -> C)
-        4. Residual: output = input + gamma * processed
+    Forward per call:
+        expand:   1×1 conv (C → C×expansion) + GN + GELU
+        process:  3×3 depthwise conv at runtime dilation → DivisiveNorm → GELU
+        contract: 1×1 conv (C×expansion → C) + GN
+        residual: output = input + γ_per_channel * processed
 
-    The dilation parameter allows the SAME weights to capture different
-    spatial scales when the block is reused multiple times.
+    The dilation argument lets the same weights capture different spatial scales
+    at each iteration — the mechanism that makes weight reuse effective.
     """
-    def __init__(self, channels: int, expansion: int = 4, layer_scale: float = 1e-3):
+    def __init__(self, channels: int, expansion: int = 4, layer_scale: float = 1e-6):
         super().__init__()
         hidden = channels * expansion
 
-        # 1x1 pointwise expansion
-        self.expand = nn.Conv2d(channels, hidden, 1, bias=False)
-        self.gn1 = nn.GroupNorm(gn_groups(hidden), hidden)
-        self.act = nn.SiLU(inplace=True)
+        self.expand   = nn.Conv2d(channels, hidden, 1, bias=False)
+        self.gn1      = nn.GroupNorm(gn_groups(hidden), hidden)
+        self.act      = nn.GELU()
 
-        # 3x3 depthwise conv (dilation set at runtime)
         self.dw_weight = nn.Parameter(torch.empty(hidden, 1, 3, 3))
-        self.dw_bias = nn.Parameter(torch.zeros(hidden))
+        self.dw_bias   = nn.Parameter(torch.zeros(hidden))
         nn.init.kaiming_normal_(self.dw_weight, mode='fan_out', nonlinearity='relu')
 
-        self.divnorm = DivisiveNorm()
+        self.divnorm  = DivisiveNorm()
+        self.act2     = nn.GELU()
 
-        # 1x1 pointwise contraction
         self.contract = nn.Conv2d(hidden, channels, 1, bias=False)
-        self.gn2 = nn.GroupNorm(gn_groups(channels), channels)
+        self.gn2      = nn.GroupNorm(gn_groups(channels), channels)
 
-        # Learnable residual scaling (starts small for stable training)
-        self.gamma = nn.Parameter(torch.ones(1) * layer_scale)
+        # Per-channel residual scale — init near zero for stable early training
+        self.gamma    = nn.Parameter(torch.ones(channels) * layer_scale)
 
     def forward(self, x: torch.Tensor, dilation: int = 1) -> torch.Tensor:
         identity = x
-
-        # Expand channels
         out = self.act(self.gn1(self.expand(x)))
-
-        # Depthwise conv with runtime dilation (key for weight reuse!)
         out = F.conv2d(out, self.dw_weight, self.dw_bias,
                        padding=dilation, dilation=dilation, groups=out.shape[1])
-        out = self.divnorm(out)
-
-        # Contract back to original channels
+        out = self.act2(self.divnorm(out))
         out = self.gn2(self.contract(out))
-
-        # Residual connection with learned scaling
-        return identity + self.gamma * out
+        return identity + self.gamma.view(1, -1, 1, 1) * out
 
 
 # ============================================================================
@@ -131,85 +119,123 @@ class ECBlock(nn.Module):
 
 class ECTiedNet(nn.Module):
     """
-    Weight-Tied Expansion-Contraction Network.
+    Weight-Tied ECNet for ImageNet.
 
     Architecture:
-        Stem (stride-4) -> [ECBlock x N with dilations] -> BlurPool -> GAP -> Linear
+        Stem (stride-4) → [N1 iters] → BlurPool → [N2 iters] → BlurPool
+                        → [N3 iters] → BlurPool → GAP → head
 
-    The core idea is weight tying: ONE ECBlock is instantiated and reused
-    N times. Different dilation rates at each iteration give varying
-    receptive fields without adding parameters.
+    ONE ECBlock instance is shared across all N1+N2+N3 iterations and all
+    three resolution levels. ONE BlurPool instance is reused three times
+    (it is stateless — no learned parameters).
 
-    Stem reduces spatial resolution by 4x before any ECBlock processing:
-        ImageNet 224x224 → 56x56; CIFAR-10 32x32 → 8x8
+    Between resolution levels the dilation schedule cycles continuously, so
+    each level sees the same mix of local and broad-context processing.
 
-    Default dilation schedule: [1, 1, 2, 1, 2, 3]
-    - Early iterations: local features (dilation=1)
-    - Later iterations: broader context (dilation=2,3)
+    Fixes vs. original design:
+        - 32× downsampling  (was 8×)  →  7×7 before GAP
+        - RF ≈ 511px  (was 143px)    →  full image coverage
+        - channels=128  (was 64)     →  richer 128-dim representation
+        - GELU after DivisiveNorm    →  nonlinearity after gain control
+        - per-channel gamma          →  ConvNeXt-style residual scaling
     """
     def __init__(
         self,
-        num_classes: int = 10,
-        channels: int = 64,
+        num_classes: int = 1000,
+        channels: int = 128,
+        stage_iterations: tuple[int, int, int] = (4, 4, 4),
         expansion: int = 4,
-        num_iterations: int = 6,
         dilations: list[int] | None = None,
+        layer_scale: float = 1e-6,
     ):
         super().__init__()
-        self.num_iterations = num_iterations
+        assert len(stage_iterations) == 3
+        self.stage_iterations = tuple(stage_iterations)
 
-        # Stride-4 stem: two 3x3 stride-2 convs
-        # ImageNet 224x224 → 56x56; CIFAR 32x32 → 8x8
+        # Stem: two 3×3 stride-2 convs  →  224×224 to 56×56
         self.stem = nn.Sequential(
             nn.Conv2d(3, channels, 3, stride=2, padding=1, bias=False),
             nn.GroupNorm(gn_groups(channels), channels),
-            nn.SiLU(inplace=True),
+            nn.GELU(),
             nn.Conv2d(channels, channels, 3, stride=2, padding=1, bias=False),
             nn.GroupNorm(gn_groups(channels), channels),
-            nn.SiLU(inplace=True),
         )
 
-        # THE weight-tied block (reused num_iterations times)
-        self.block = ECBlock(channels, expansion=expansion)
+        # THE shared block — one instance reused across all iterations
+        self.block = ECBlock(channels, expansion=expansion, layer_scale=layer_scale)
 
-        # Downsample midway through iterations
+        # THE shared BlurPool — stateless, reused three times (56→28, 28→14, 14→7)
         self.blur = BlurPool2d(channels, stride=2)
 
-        # Classification head
         self.head = nn.Linear(channels, num_classes)
 
-        # Dilation schedule for multi-scale processing (cycles if more iterations than entries)
-        base_dilations = dilations or [1, 1, 2, 1, 2, 3]
-        self.dilations = [base_dilations[t % len(base_dilations)] for t in range(num_iterations)]
+        # Flat dilation schedule — cycles continuously across all iterations
+        total = sum(stage_iterations)
+        base = dilations or [1, 2, 3, 2]
+        self.dilations = [base[t % len(base)] for t in range(total)]
+
+    def _forward_body(self, x: torch.Tensor):
+        """Shared forward through stem + all iterations + BlurPools.
+
+        Returns (s1, s2, s3, out) where:
+            s1  — spatial map after N1 iters at 56×56  (before first BlurPool)
+            s2  — spatial map after N2 iters at 28×28  (before second BlurPool)
+            s3  — spatial map after N3 iters at 14×14  (before third BlurPool)
+            out — spatial map after third BlurPool at 7×7  (used for classification)
+        """
+        N1, N2, N3 = self.stage_iterations
+        t = 0
+        x = self.stem(x)
+
+        for _ in range(N1):
+            x = self.block(x, dilation=self.dilations[t]); t += 1
+        s1 = x
+        x = self.blur(x)
+
+        for _ in range(N2):
+            x = self.block(x, dilation=self.dilations[t]); t += 1
+        s2 = x
+        x = self.blur(x)
+
+        for _ in range(N3):
+            x = self.block(x, dilation=self.dilations[t]); t += 1
+        s3 = x
+        x = self.blur(x)
+
+        return s1, s2, s3, x
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
-        """Pre-classifier representation (post-GAP). Used for RSA analysis."""
-        x = self.stem(x)
-        for t in range(self.num_iterations):
-            x = self.block(x, dilation=self.dilations[t])
-            if t == (self.num_iterations // 2) - 1:
-                x = self.blur(x)
-        return x.mean(dim=(2, 3))  # [B, channels]
+        """Final post-GAP representation (7×7 → channels-dim). Used for classification."""
+        *_, out = self._forward_body(x)
+        return out.mean(dim=(2, 3))
+
+    def extract_stage_features(self, x: torch.Tensor) -> list[torch.Tensor]:
+        """Post-GAP features at each resolution level. For RSA: s1→V1, s2→V4, s3→IT.
+
+        Returns [(B,C), (B,C), (B,C)] — same channel width, different spatial context.
+        """
+        s1, s2, s3, _ = self._forward_body(x)
+        return [s.mean(dim=(2, 3)) for s in [s1, s2, s3]]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.head(self.extract_features(x))
 
 
 # ============================================================================
-# Utility Functions
+# Utility
 # ============================================================================
 
 def count_parameters(model: nn.Module) -> int:
-    """Count trainable parameters in model."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 if __name__ == "__main__":
-    # Quick sanity check
-    model = ECTiedNet(num_classes=10, channels=64, num_iterations=6)
-    print(f"ECTiedNet for CIFAR-10")
+    model = ECTiedNet(num_classes=1000)
     print(f"Parameters: {count_parameters(model):,}")
 
-    x = torch.randn(2, 3, 32, 32)
+    x = torch.randn(2, 3, 224, 224)
     y = model(x)
-    print(f"Input: {x.shape} -> Output: {y.shape}")
+    print(f"Input:  {x.shape}  →  Output: {y.shape}")
+
+    stages = model.extract_stage_features(x)
+    print(f"Stage features: {[tuple(s.shape) for s in stages]}")

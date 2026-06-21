@@ -1,20 +1,31 @@
 """
-RSA evaluation: brain-model alignment for ECTiedNet.
+RSA evaluation: ventral stream alignment for ECTiedNet.
 
-Extracts pre-classifier (post-GAP) activations, builds a model RDM using
-1 - Pearson correlation (same as visreps), then scores against a brain RDM
-using Spearman correlation.
+Extracts per-stage post-GAP representations (Stage1, Stage2, Stage3),
+builds one RDM per stage, then scores each against brain ROI responses
+(V1, V4, IT) via Spearman correlation.
+
+The core result is a 3×3 RSA matrix (model stages × brain ROIs). If the
+weight-tied hierarchy tracks the ventral stream, the diagonal should dominate:
+  Stage1 ↔ V1 > Stage1 ↔ V4, IT
+  Stage2 ↔ V4 > Stage2 ↔ V1, IT
+  Stage3 ↔ IT > Stage3 ↔ V1, V4
+
+Brain data .npz format:
+    v1 : float32 (N, V1_voxels)  — V1 responses, N stimuli in dataset order
+    v4 : float32 (N, V4_voxels)  — V4 responses
+    it : float32 (N, IT_voxels)  — IT/HVC responses
+    (include any subset; missing ROIs are skipped)
 
 Usage:
-    # Save model RDM now; score later when brain data arrives
-    python rsa_eval.py --checkpoint best_model_imagenet-mini-50_....pth
+    # Save per-stage RDMs now; score later when brain data arrives
+    python rsa_eval.py --checkpoint best_model_imagenet_iter4-4-4_....pth
 
-    # Full RSA with brain data
-    python rsa_eval.py --checkpoint best_model_....pth --brain-data neural.npz
+    # Full 3×3 RSA matrix against V1/V4/IT
+    python rsa_eval.py --checkpoint best_model_....pth --brain-data nsd_responses.npz
 
-Brain data format (.npz):
-    responses : float32 array (N, V)  — N stimuli × V voxels
-                stimuli must be in the same order as the dataset split used here
+    # With 90% bootstrap CIs
+    python rsa_eval.py --checkpoint ... --brain-data ... --bootstrap
 """
 import argparse
 import json
@@ -28,24 +39,42 @@ from imagenet_mini_dataloader import get_dataloaders
 
 DATASET_NUM_CLASSES = {"cifar10": 10, "imagenet-mini-50": 1000, "imagenet": 1000}
 
+# Stage index → model stage name → expected brain area
+STAGE_NAMES = ["stage1", "stage2", "stage3"]
+STAGE_AREAS = ["V1",     "V4",     "IT"]
+ROI_KEYS    = ["v1",     "v4",     "it"]   # expected keys in brain .npz
+
 
 # ---------------------------------------------------------------------------
 # Feature extraction
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def extract_features(model, loader, device):
-    """Returns (N, C) numpy array of post-GAP activations and (N,) labels."""
+def extract_stage_features(model, loader, device):
+    """Extract per-stage post-GAP features for all images.
+
+    Returns:
+        stage_dict: {"stage1": (N,C1), "stage2": (N,C2), "stage3": (N,C3)} numpy arrays
+        labels:     (N,) numpy array
+    """
     model.eval()
-    feats, labels = [], []
+    stage_bufs = [[] for _ in range(3)]
+    label_buf  = []
     for imgs, lbls in loader:
-        feats.append(model.extract_features(imgs.to(device)).cpu())
-        labels.append(lbls)
-    return torch.cat(feats).numpy(), torch.cat(labels).numpy()
+        per_stage = model.extract_stage_features(imgs.to(device))  # list of 3 tensors
+        for i, feat in enumerate(per_stage):
+            stage_bufs[i].append(feat.cpu())
+        label_buf.append(lbls)
+    labels = torch.cat(label_buf).numpy()
+    stage_dict = {
+        name: torch.cat(buf).numpy()
+        for name, buf in zip(STAGE_NAMES, stage_bufs)
+    }
+    return stage_dict, labels
 
 
 # ---------------------------------------------------------------------------
-# RSA (mirrors visreps/analysis/rsa.py)
+# RSA
 # ---------------------------------------------------------------------------
 
 def compute_rdm(X):
@@ -82,8 +111,8 @@ def load_model(args, device):
     model = ECTiedNet(
         num_classes=DATASET_NUM_CLASSES[args.dataset],
         channels=args.channels,
+        stage_iterations=tuple(args.stage_iterations),
         expansion=args.expansion,
-        num_iterations=args.iterations,
         dilations=args.dilations,
     ).to(device)
     state = torch.load(args.checkpoint, map_location=device, weights_only=True)
@@ -102,17 +131,18 @@ def main():
     parser.add_argument("--checkpoint", required=True,
                         help="Path to best_model_*.pth or checkpoint_*.pth")
     parser.add_argument("--brain-data", default=None,
-                        help=".npz with 'responses' (N, V), stimuli in dataset order")
-    parser.add_argument("--dataset", default="imagenet-mini-50",
+                        help=".npz with keys 'v1', 'v4', 'it' — each (N, voxels)")
+    parser.add_argument("--dataset", default="imagenet",
                         choices=list(DATASET_NUM_CLASSES))
     parser.add_argument("--split", default="test", choices=["train", "test"])
-    parser.add_argument("--channels", type=int, default=64)
-    parser.add_argument("--iterations", type=int, default=6)
+    parser.add_argument("--channels", type=int, default=128)
+    parser.add_argument("--stage-iterations", type=int, nargs=3, default=[4, 4, 4],
+                        metavar=("N1", "N2", "N3"))
     parser.add_argument("--expansion", type=int, default=4)
     parser.add_argument("--dilations", type=int, nargs="+", default=None)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--bootstrap", action="store_true",
-                        help="Compute 90%% bootstrap CI (n=1000)")
+                        help="Compute 90%% bootstrap CI per RSA score (n=1000)")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -123,53 +153,90 @@ def main():
     loader = test_loader if args.split == "test" else train_loader
     n_imgs = len(loader.dataset)
 
-    print(f"Extracting features ({n_imgs} images, {args.split} split)...")
-    feats, labels = extract_features(model, loader, device)
-    print(f"Features: {feats.shape}")
+    print(f"Extracting per-stage features ({n_imgs} images, {args.split} split)...")
+    stage_dict, labels = extract_stage_features(model, loader, device)
+    for name, area, feats in zip(STAGE_NAMES, STAGE_AREAS, stage_dict.values()):
+        print(f"  {name} ({area}): {feats.shape}")
 
-    print("Computing model RDM (1 - Pearson)...")
-    model_rdm = compute_rdm(feats)
-
+    # Compute and save one RDM per stage
     stem = Path(args.checkpoint).stem
-    np.save(f"{stem}_rdm.npy", model_rdm)
+    stage_rdms = {}
+    for name, feats in stage_dict.items():
+        print(f"Computing RDM for {name}...")
+        rdm = compute_rdm(feats)
+        stage_rdms[name] = rdm
+        rdm_path = f"{stem}_{name}_rdm.npy"
+        np.save(rdm_path, rdm)
+        print(f"  Saved {rdm_path}  ({rdm.shape[0]}×{rdm.shape[0]})")
     np.save(f"{stem}_labels.npy", labels)
-    print(f"Saved {stem}_rdm.npy  ({model_rdm.shape[0]}×{model_rdm.shape[0]})")
 
     if args.brain_data is None:
         print("\nNo brain data provided — re-run with --brain-data <path> when available.")
+        print(f"Expected .npz keys: {ROI_KEYS}  (one array per brain ROI, shape: N × voxels)")
         return
 
+    # Load brain data
     print(f"\nLoading brain data: {args.brain_data}")
     brain = np.load(args.brain_data)
-    responses = brain["responses"].astype(np.float64)  # (N, V)
-    print(f"Brain responses: {responses.shape}")
+    available_rois = [k for k in ROI_KEYS if k in brain]
+    if not available_rois:
+        raise ValueError(
+            f"No expected ROI keys found. Got: {list(brain.keys())}. "
+            f"Expected one or more of: {ROI_KEYS}"
+        )
+    print(f"Found ROIs: {[r.upper() for r in available_rois]}")
 
-    n = min(len(feats), len(responses))
-    if len(feats) != len(responses):
-        print(f"Warning: stimulus count mismatch ({len(feats)} vs {len(responses)}), using {n}")
+    # Compute brain RDMs, align stimulus count
+    brain_rdms = {}
+    n_stimuli = len(labels)
+    for roi_key in available_rois:
+        responses = brain[roi_key].astype(np.float64)  # (N, voxels)
+        n = min(n_stimuli, len(responses))
+        if len(responses) != n_stimuli:
+            print(f"  Warning: {roi_key.upper()} stimulus count mismatch "
+                  f"({len(responses)} vs {n_stimuli}), truncating to {n}")
+        brain_rdms[roi_key] = compute_rdm(responses[:n])
+        n_stimuli = n  # align all ROIs to the same N
+        print(f"  {roi_key.upper()}: {responses.shape} → RDM {n}×{n}")
 
-    brain_rdm = compute_rdm(responses[:n])
-    r, p = compute_rsa(model_rdm[:n, :n], brain_rdm)
-    print(f"RSA (Spearman r): {r:.4f}  p={p:.3e}")
+    # Print and compute full RSA matrix: model stages × brain ROIs
+    print(f"\nRSA matrix (Spearman r), n={n_stimuli} stimuli:")
+    roi_labels = [r.upper() for r in available_rois]
+    col_w = 22 if args.bootstrap else 10
+    print(f"{'':16s}" + "".join(f"{r:>{col_w}s}" for r in roi_labels))
 
+    rsa_matrix = {}
+    for stage_name, area_name in zip(STAGE_NAMES, STAGE_AREAS):
+        rdm_model = stage_rdms[stage_name][:n_stimuli, :n_stimuli]
+        row = {}
+        row_str = f"{stage_name} ({area_name}):  "
+        for roi_key in available_rois:
+            rdm_brain = brain_rdms[roi_key][:n_stimuli, :n_stimuli]
+            r, p = compute_rsa(rdm_model, rdm_brain)
+            entry = {"r": float(r), "p": float(p)}
+            if args.bootstrap:
+                ci_lo, ci_hi = bootstrap_rsa(rdm_model, rdm_brain)
+                entry["ci_90"] = [ci_lo, ci_hi]
+                row_str += f"  {r:.3f}[{ci_lo:.3f},{ci_hi:.3f}]"
+            else:
+                row_str += f"  {r:>8.4f}  "
+            row[roi_key] = entry
+        print(row_str)
+        rsa_matrix[stage_name] = row
+
+    # Save results
     results = {
-        "checkpoint": args.checkpoint,
-        "dataset": args.dataset,
-        "split": args.split,
-        "n_stimuli": n,
-        "rsa_spearman_r": float(r),
-        "p_value": float(p),
+        "checkpoint":      args.checkpoint,
+        "dataset":         args.dataset,
+        "split":           args.split,
+        "n_stimuli":       n_stimuli,
+        "stage_to_area":   dict(zip(STAGE_NAMES, STAGE_AREAS)),
+        "rsa_matrix":      rsa_matrix,
     }
-
-    if args.bootstrap:
-        ci_lo, ci_hi = bootstrap_rsa(model_rdm[:n, :n], brain_rdm)
-        results["ci_90"] = [ci_lo, ci_hi]
-        print(f"90% CI: [{ci_lo:.4f}, {ci_hi:.4f}]")
-
     out = f"{stem}_rsa.json"
     with open(out, "w") as f:
         json.dump(results, f, indent=2)
-    print(f"Saved {out}")
+    print(f"\nSaved {out}")
 
 
 if __name__ == "__main__":
