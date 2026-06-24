@@ -37,12 +37,8 @@ def train_epoch(model, loader, optimizer, criterion, device):
     model.train()
     total_loss, correct, total = 0, 0, 0
 
-    for batch_idx, (inputs, targets) in enumerate(loader):
-        if batch_idx == 0:
-            print(f"[MEM] after  first batch CPU load: {torch.cuda.memory_allocated()/1e9:.2f} GB")
+    for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
-        if batch_idx == 0:
-            print(f"[MEM] after  inputs.to(device):   {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
         optimizer.zero_grad()
         outputs = model(inputs)
@@ -84,7 +80,7 @@ def main():
     parser.add_argument('--dataset', default='cifar10', choices=list(DATASET_NUM_CLASSES),
                         help='Dataset to train on (default: cifar10)')
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=0.05)
     parser.add_argument('--optimizer', default='adamw', choices=['sgd', 'adamw'],
                         help='Optimizer to use (default: adamw)')
@@ -119,9 +115,7 @@ def main():
     print(f"Optimizer: {args.optimizer}, lr={args.lr}, wd={args.weight_decay}")
 
     # Data
-    print(f"[MEM] before DataLoader:  {torch.cuda.memory_allocated()/1e9:.2f} GB")
     train_loader, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size)
-    print(f"[MEM] after  DataLoader:  {torch.cuda.memory_allocated()/1e9:.2f} GB")
     num_classes = DATASET_NUM_CLASSES[args.dataset]
     print(f"Dataset: {args.dataset} ({num_classes} classes)")
 
@@ -133,7 +127,6 @@ def main():
         expansion=args.expansion,
         dilations=args.dilations,
     ).to(device)
-    print(f"[MEM] after  model.to():  {torch.cuda.memory_allocated()/1e9:.2f} GB")
     print(f"Parameters:       {count_parameters(model):,}")
     print(f"Channels:         {args.channels}")
     print(f"Stage iterations: {args.stage_iterations} ({sum(args.stage_iterations)} total)")

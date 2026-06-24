@@ -30,7 +30,11 @@ Stage-to-brain-area mapping (for RSA):
 
 ## Training defaults
 - AdamW, weight decay 0.01, cosine annealing LR
-- Batch 128, 200 epochs. ImageNet LR: tune via sweep (1e-3 is a good starting point).
+- Batch 32, 200 epochs. ImageNet LR: tune via sweep (1e-3 is a good starting point).
+- Batch size is constrained by activation memory, not parameter count. At stage 1 (56×56,
+  512 hidden channels), backprop must retain ~7 tensors × 822 MB × 4 iterations ≈ 23 GB
+  for batch=128 — exceeding the 4090's 24 GB. Batch=32 uses ~7 GB. Batch=64 (~14 GB) also
+  fits with headroom.
 - `num_workers=4`, `pin_memory=True` in DataLoader (default from `get_dataloaders` in `imagenet_mini_dataloader.py`).
 
 ## CLI args (train.py)
