@@ -32,7 +32,7 @@ DATASET_NUM_CLASSES = {
 # Training and Evaluation
 # ============================================================================
 
-def train_epoch(model, loader, optimizer, criterion, device):
+def train_epoch(model, loader, optimizer, criterion, device, scaler):
     """Train for one epoch. Returns (loss, accuracy)."""
     model.train()
     total_loss, correct, total = 0, 0, 0
@@ -41,12 +41,13 @@ def train_epoch(model, loader, optimizer, criterion, device):
         inputs, targets = inputs.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
+        with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
-        # Track metrics
         total_loss += loss.item() * inputs.size(0)
         correct += outputs.argmax(1).eq(targets).sum().item()
         total += targets.size(0)
@@ -62,8 +63,9 @@ def evaluate(model, loader, criterion, device):
 
     for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+        with torch.autocast(device_type=device.type, enabled=device.type == 'cuda'):
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
 
         total_loss += loss.item() * inputs.size(0)
         correct += outputs.argmax(1).eq(targets).sum().item()
@@ -81,7 +83,7 @@ def main():
     parser.add_argument('--dataset', default='cifar10', choices=list(DATASET_NUM_CLASSES),
                         help='Dataset to train on (default: cifar10)')
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--batch-size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=0.05)
     parser.add_argument('--optimizer', default='adamw', choices=['sgd', 'adamw'],
                         help='Optimizer to use (default: adamw)')
@@ -116,7 +118,7 @@ def main():
     print(f"Optimizer: {args.optimizer}, lr={args.lr}, wd={args.weight_decay}")
 
     # Data
-    train_loader, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size)
+    train_loader, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size, num_workers=8)
     num_classes = DATASET_NUM_CLASSES[args.dataset]
     print(f"Dataset: {args.dataset} ({num_classes} classes)")
 
@@ -142,6 +144,8 @@ def main():
         optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=wd)
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
+    scaler = torch.cuda.amp.GradScaler(enabled=device.type == 'cuda')
+
     # Snapshot weights at initialization for distribution comparison
     init_weights = {name: param.detach().cpu().clone()
                     for name, param in model.named_parameters() if param.requires_grad}
@@ -157,6 +161,8 @@ def main():
         model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         scheduler.load_state_dict(checkpoint['scheduler'])
+        if 'scaler' in checkpoint:
+            scaler.load_state_dict(checkpoint['scaler'])
         start_epoch = checkpoint['epoch'] + 1
         best_acc = checkpoint['best_acc']
         history = checkpoint['history']
@@ -165,7 +171,7 @@ def main():
     # Training loop
     for epoch in range(start_epoch, args.epochs):
         t0 = time.time()
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device, scaler)
         test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         scheduler.step()
         epoch_time = time.time() - t0
@@ -188,6 +194,7 @@ def main():
                 'model': model.state_dict(),
                 'optimizer': optimizer.state_dict(),
                 'scheduler': scheduler.state_dict(),
+                'scaler': scaler.state_dict(),
                 'best_acc': best_acc,
                 'history': history,
             }, f'checkpoint_{run_name}.pth')
