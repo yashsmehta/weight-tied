@@ -83,7 +83,7 @@ def main():
     parser.add_argument('--dataset', default='cifar10', choices=list(DATASET_NUM_CLASSES),
                         help='Dataset to train on (default: cifar10)')
     parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch-size', type=int, default=256)
+    parser.add_argument('--batch-size', type=int, default=128)
     parser.add_argument('--lr', type=float, default=0.05)
     parser.add_argument('--optimizer', default='adamw', choices=['sgd', 'adamw'],
                         help='Optimizer to use (default: adamw)')
