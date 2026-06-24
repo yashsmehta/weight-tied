@@ -186,6 +186,7 @@ class ECTiedNet(nn.Module):
         N1, N2, N3 = self.stage_iterations
         t = 0
         x = self.stem(x)
+        print(f"[MEM] after stem:    {torch.cuda.memory_allocated()/1e9:.2f} GB")
 
         for _ in range(N1):
             x = self.block(x, dilation=self.dilations[t]); t += 1
