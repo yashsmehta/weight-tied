@@ -31,7 +31,7 @@ Stage-to-brain-area mapping (for RSA):
 ## Training defaults
 - AdamW, weight decay 0.01, cosine annealing LR
 - Batch 128, 200 epochs. ImageNet LR: tune via sweep (1e-3 is a good starting point).
-- `num_workers=8`, `pin_memory=True` in DataLoader (hardcoded in `train.py` call to `get_dataloaders`).
+- `num_workers=4`, `pin_memory=True` in DataLoader (default from `get_dataloaders` in `imagenet_mini_dataloader.py`).
 
 ## CLI args (train.py)
 - `--dataset imagenet|imagenet-mini-50|cifar10` (default: cifar10)

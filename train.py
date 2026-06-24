@@ -115,7 +115,7 @@ def main():
     print(f"Optimizer: {args.optimizer}, lr={args.lr}, wd={args.weight_decay}")
 
     # Data
-    train_loader, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size, num_workers=8)
+    train_loader, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size)
     num_classes = DATASET_NUM_CLASSES[args.dataset]
     print(f"Dataset: {args.dataset} ({num_classes} classes)")
 
