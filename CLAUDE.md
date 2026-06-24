@@ -31,9 +31,7 @@ Stage-to-brain-area mapping (for RSA):
 ## Training defaults
 - AdamW, weight decay 0.01, cosine annealing LR
 - Batch 128, 200 epochs. ImageNet LR: tune via sweep (1e-3 is a good starting point).
-- AMP enabled (`torch.autocast` + `GradScaler`) — float16 on CUDA, no-op on CPU.
 - `num_workers=8`, `pin_memory=True` in DataLoader (hardcoded in `train.py` call to `get_dataloaders`).
-- Checkpoints include `scaler` state; old checkpoints without it load fine (key is optional on resume).
 
 ## CLI args (train.py)
 - `--dataset imagenet|imagenet-mini-50|cifar10` (default: cifar10)
