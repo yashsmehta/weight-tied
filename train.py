@@ -1,74 +1,146 @@
 """
-Training script for ECTiedNet.
+Training script for ECTiedNet on CIFAR-10.
 
-Usage:
-    python train.py --dataset imagenet                     # ImageNet with defaults
-    python train.py --dataset imagenet --lr 1e-3           # Custom LR
-    python train.py --stage-iterations 6 6 6               # Deeper (18 total iterations)
-    python train.py --channels 128                          # Explicit channel width
-    python train.py --dilations 1 1 1 1                    # No dilation (ablation)
-    python train.py --dilations 1 2 3 2                    # Default dilation schedule
-    python train.py --resume checkpoint_imagenet_iter4-4-4_dil1-2-3-2_adamw_lr1e-3.pth
+Usage
+-----
+    # Baseline run
+    python train.py
+
+    # Custom width and longer schedule
+    python train.py --channels 128 --epochs 300
+
+    # Resume from checkpoint
+    python train.py --resume checkpoints/best.pt
+
+Training additions over a plain SGD loop
+-----------------------------------------
+AMP (mixed precision):
+    Forward and loss computed in float16; weights updated in float32.
+    Negligible accuracy cost; significant speedup on modern GPUs.
+
+Gradient clipping (max_norm=1.0):
+    The same weights accumulate gradients from all N iterations of the shared
+    block — the gradient w.r.t. W is the sum of N per-iteration terms, which
+    can be substantially larger than a single-layer gradient. Clipping prevents
+    any one destabilising update. LayerScale in ECBlock provides complementary
+    protection by keeping early residual contributions near zero.
+
+LR warmup (5 epochs, linear):
+    Ramps LR from 10% of its target to full value before cosine decay begins.
+    At random initialisation, recursive block application compounds noise across
+    iterations; small early updates reduce the chance of an unlucky large step
+    setting the shared weights onto a poor trajectory.
+
+Label smoothing:
+    Off by default (0.0) for CIFAR-10 development; set to 0.1 for ImageNet.
+    Prevents overconfident predictions and keeps gradients informative late
+    in training when the model would otherwise coast on saturated softmax outputs.
+
+Checkpointing:
+    Saves full training state (model, optimiser, scheduler, scaler) every
+    --save-every epochs and whenever a new best accuracy is reached. Pass
+    --resume <path> to continue an interrupted run without losing progress.
 """
 import argparse
-import json
-import time
+import os
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import matplotlib.pyplot as plt
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 
 from model import ECTiedNet, count_parameters
-from imagenet_mini_dataloader import get_dataloaders
 
-DATASET_NUM_CLASSES = {
-    "cifar10": 10,
-    "imagenet-mini-50": 1000,
-    "imagenet": 1000,
-}
+
+# ============================================================================
+# Data Loading
+# ============================================================================
+
+def get_dataloaders(batch_size: int = 128, num_workers: int = 4):
+    """
+    CIFAR-10 train/test loaders with standard augmentation.
+
+    Train: RandomCrop(32, padding=4) + RandomHorizontalFlip + Normalize
+    Test:  Normalize only (no augmentation)
+    """
+    mean = (0.4914, 0.4822, 0.4465)
+    std  = (0.2470, 0.2435, 0.2616)
+
+    train_transform = transforms.Compose([
+        transforms.RandomCrop(32, padding=4),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+    test_transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean, std),
+    ])
+
+    train_dataset = datasets.CIFAR10('./data', train=True,  download=True, transform=train_transform)
+    test_dataset  = datasets.CIFAR10('./data', train=False, download=True, transform=test_transform)
+
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=True)
+    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False,
+                              num_workers=num_workers, pin_memory=True)
+
+    return train_loader, test_loader
 
 
 # ============================================================================
 # Training and Evaluation
 # ============================================================================
 
-def train_epoch(model, loader, optimizer, criterion, device):
-    """Train for one epoch. Returns (loss, accuracy)."""
+def train_epoch(model, loader, optimizer, scaler, criterion, device):
+    """Train for one epoch. Returns (avg_loss, accuracy %)."""
     model.train()
-    total_loss, correct, total = 0, 0, 0
+    total_loss, correct, total = 0.0, 0, 0
 
     for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
 
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
-        loss.backward()
-        optimizer.step()
+
+        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+            outputs = model(inputs)
+            loss    = criterion(outputs, targets)
+
+        scaler.scale(loss).backward()
+
+        # Unscale before clipping so clip threshold is in the original gradient scale
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        scaler.step(optimizer)
+        scaler.update()
 
         total_loss += loss.item() * inputs.size(0)
-        correct += outputs.argmax(1).eq(targets).sum().item()
-        total += targets.size(0)
+        correct    += outputs.argmax(1).eq(targets).sum().item()
+        total      += targets.size(0)
 
-    return total_loss / total, 100. * correct / total
+    return total_loss / total, 100.0 * correct / total
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device):
-    """Evaluate on test set. Returns (loss, accuracy)."""
+    """Evaluate on test set. Returns (avg_loss, accuracy %)."""
     model.eval()
-    total_loss, correct, total = 0, 0, 0
+    total_loss, correct, total = 0.0, 0, 0
 
     for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
-        outputs = model(inputs)
-        loss = criterion(outputs, targets)
+
+        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+            outputs = model(inputs)
+            loss    = criterion(outputs, targets)
 
         total_loss += loss.item() * inputs.size(0)
-        correct += outputs.argmax(1).eq(targets).sum().item()
-        total += targets.size(0)
+        correct    += outputs.argmax(1).eq(targets).sum().item()
+        total      += targets.size(0)
 
-    return total_loss / total, 100. * correct / total
+    return total_loss / total, 100.0 * correct / total
 
 
 # ============================================================================
@@ -76,177 +148,113 @@ def evaluate(model, loader, criterion, device):
 # ============================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description='Train ECTiedNet')
-    parser.add_argument('--dataset', default='cifar10', choices=list(DATASET_NUM_CLASSES),
-                        help='Dataset to train on (default: cifar10)')
-    parser.add_argument('--epochs', type=int, default=200)
-    parser.add_argument('--batch-size', type=int, default=32)
-    parser.add_argument('--lr', type=float, default=0.05)
-    parser.add_argument('--optimizer', default='adamw', choices=['sgd', 'adamw'],
-                        help='Optimizer to use (default: adamw)')
-    parser.add_argument('--weight-decay', type=float, default=0.01,
-                        help='Weight decay (default: 0.01 for adamw, 5e-4 for sgd)')
-    parser.add_argument('--channels', type=int, default=128,
-                        help='Channel width (single value, shared across all iterations, default: 128)')
-    parser.add_argument('--stage-iterations', type=int, nargs=3, default=[4, 4, 4],
-                        metavar=('N1', 'N2', 'N3'),
-                        help='ECBlock iterations per stage (default: 4 4 4 = 12 total)')
-    parser.add_argument('--expansion', type=int, default=4, help='Expansion ratio in ECBlock')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--dilations', type=int, nargs='+', default=None,
-                        help='Dilation schedule e.g. --dilations 1 1 2 1 2 3')
-    parser.add_argument('--resume', type=str, default=None,
-                        help='Path to checkpoint file to resume training from')
-    parser.add_argument('--checkpoint-every', type=int, default=10,
-                        help='Save a resumable checkpoint every N epochs (default: 10)')
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description='Train ECTiedNet on CIFAR-10')
 
-    # Build a run name that uniquely identifies this config across all output files
-    dil_str = '-'.join(map(str, args.dilations)) if args.dilations else '1-2-3-2'
-    iters_str = '-'.join(map(str, args.stage_iterations))
-    lr_str = f"{args.lr:.0e}".replace('-0', '-').replace('+0', '')
-    run_name = f"{args.dataset}_ch{args.channels}_iter{iters_str}_dil{dil_str}_{args.optimizer}_lr{lr_str}"
+    # Model
+    parser.add_argument('--channels',    type=int,   default=64,   help='Base channel width')
+    parser.add_argument('--expansion',   type=int,   default=4,    help='Block expansion ratio')
+    parser.add_argument('--iterations',  type=int,   default=6,    help='Block reuse count')
+
+    # Training
+    parser.add_argument('--epochs',          type=int,   default=200)
+    parser.add_argument('--batch-size',      type=int,   default=128)
+    parser.add_argument('--lr',              type=float, default=0.1)
+    parser.add_argument('--weight-decay',    type=float, default=5e-4)
+    parser.add_argument('--warmup-epochs',   type=int,   default=5)
+    parser.add_argument('--label-smoothing', type=float, default=0.0,
+                        help='0.0 for CIFAR-10; use 0.1 for ImageNet')
+
+    # Checkpointing
+    parser.add_argument('--save-dir',   type=str, default='checkpoints')
+    parser.add_argument('--save-every', type=int, default=50,  help='Save checkpoint every N epochs')
+    parser.add_argument('--resume',     type=str, default=None, help='Path to checkpoint to resume from')
+
+    # Misc
+    parser.add_argument('--num-workers', type=int, default=4)
+    parser.add_argument('--seed',        type=int, default=42)
+
+    args = parser.parse_args()
 
     # Setup
     torch.manual_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Device:    {device}")
-    print(f"Run:       {run_name}")
-    print(f"Optimizer: {args.optimizer}, lr={args.lr}, wd={args.weight_decay}")
+    os.makedirs(args.save_dir, exist_ok=True)
+    print(f"Device: {device}\n")
 
     # Data
-    train_loader, test_loader = get_dataloaders(dataset=args.dataset, batch_size=args.batch_size)
-    num_classes = DATASET_NUM_CLASSES[args.dataset]
-    print(f"Dataset: {args.dataset} ({num_classes} classes)")
+    train_loader, test_loader = get_dataloaders(args.batch_size, args.num_workers)
 
     # Model
     model = ECTiedNet(
-        num_classes=num_classes,
+        num_classes=10,
         channels=args.channels,
-        stage_iterations=tuple(args.stage_iterations),
         expansion=args.expansion,
-        dilations=args.dilations,
+        num_iterations=args.iterations,
     ).to(device)
-    print(f"Parameters:       {count_parameters(model):,}")
-    print(f"Channels:         {args.channels}")
-    print(f"Stage iterations: {args.stage_iterations} ({sum(args.stage_iterations)} total)")
-    print(f"Dilations:        {model.dilations}")
+    print(f"Parameters: {count_parameters(model):,}")
 
-    # Loss, optimizer, scheduler
-    criterion = nn.CrossEntropyLoss()
-    if args.optimizer == 'adamw':
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    else:
-        wd = args.weight_decay if args.weight_decay != 0.01 else 5e-4
-        optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=wd)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
+    # Loss, optimiser, LR schedule, AMP scaler
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    optimizer = optim.SGD(model.parameters(), lr=args.lr,
+                          momentum=0.9, weight_decay=args.weight_decay)
+    scaler    = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
 
-    # Snapshot weights at initialization for distribution comparison
-    init_weights = {name: param.detach().cpu().clone()
-                    for name, param in model.named_parameters() if param.requires_grad}
+    # Linear warmup → cosine decay
+    warmup_sched = optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=0.1, total_iters=args.warmup_epochs
+    )
+    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.epochs - args.warmup_epochs
+    )
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer, schedulers=[warmup_sched, cosine_sched],
+        milestones=[args.warmup_epochs],
+    )
 
-    # Training state — overwritten below if resuming
-    start_epoch = 0
-    best_acc = 0.0
-    history = {"train_loss": [], "test_loss": [], "train_acc": [], "test_acc": [], "epoch_time": []}
-
-    # Resume from checkpoint if requested
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location=device)
-        model.load_state_dict(checkpoint['model'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        scheduler.load_state_dict(checkpoint['scheduler'])
-        start_epoch = checkpoint['epoch'] + 1
-        best_acc = checkpoint['best_acc']
-        history = checkpoint['history']
-        print(f"Resumed from epoch {start_epoch}/{args.epochs}, best acc so far: {best_acc:.2f}%")
+    # Resume from checkpoint
+    start_epoch, best_acc = 0, 0.0
+    if args.resume and os.path.exists(args.resume):
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt['model'])
+        optimizer.load_state_dict(ckpt['optimizer'])
+        scheduler.load_state_dict(ckpt['scheduler'])
+        scaler.load_state_dict(ckpt['scaler'])
+        start_epoch = ckpt['epoch'] + 1
+        best_acc    = ckpt['best_acc']
+        print(f"Resumed from epoch {ckpt['epoch']}  (best acc so far: {best_acc:.2f}%)\n")
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-        t0 = time.time()
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, scaler, criterion, device)
+        test_loss,  test_acc  = evaluate(model, test_loader, criterion, device)
         scheduler.step()
-        epoch_time = time.time() - t0
 
-        history["train_loss"].append(train_loss)
-        history["test_loss"].append(test_loss)
-        history["train_acc"].append(train_acc)
-        history["test_acc"].append(test_acc)
-        history["epoch_time"].append(epoch_time)
-
-        # Save best model
-        if test_acc > best_acc:
-            best_acc = test_acc
-            torch.save(model.state_dict(), f'best_model_{run_name}.pth')
-
-        # Save resumable checkpoint every N epochs
-        if (epoch + 1) % args.checkpoint_every == 0:
-            torch.save({
-                'epoch': epoch,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'best_acc': best_acc,
-                'history': history,
-            }, f'checkpoint_{run_name}.pth')
+        is_best  = test_acc > best_acc
+        best_acc = max(test_acc, best_acc)
 
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
-              f"Train: {train_loss:.4f} / {train_acc:.2f}% | "
-              f"Test: {test_loss:.4f} / {test_acc:.2f}% | "
-              f"Best: {best_acc:.2f}% | "
-              f"Time: {epoch_time:.1f}s")
+              f"train {train_loss:.4f} / {train_acc:.2f}% | "
+              f"test {test_loss:.4f} / {test_acc:.2f}% | "
+              f"best {best_acc:.2f}%  "
+              f"{'*' if is_best else ''}")
 
-    print(f"\nDone. Best accuracy: {best_acc:.2f}%")
+        # Save checkpoint
+        if is_best or (epoch + 1) % args.save_every == 0:
+            ckpt = {
+                'epoch':     epoch,
+                'model':     model.state_dict(),
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'scaler':    scaler.state_dict(),
+                'best_acc':  best_acc,
+                'args':      vars(args),
+            }
+            if is_best:
+                torch.save(ckpt, os.path.join(args.save_dir, 'best.pt'))
+            if (epoch + 1) % args.save_every == 0:
+                torch.save(ckpt, os.path.join(args.save_dir, f'epoch_{epoch+1:03d}.pt'))
 
-    # Save history to JSON for later use
-    with open(f"history_{run_name}.json", "w") as f:
-        json.dump(history, f)
-
-    # Plot training curves
-    epochs = range(1, len(history["train_acc"]) + 1)
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4))
-
-    ax1.plot(epochs, history["train_acc"], label="Train")
-    ax1.plot(epochs, history["test_acc"], label="Test")
-    ax1.set_xlabel("Epoch")
-    ax1.set_ylabel("Accuracy (%)")
-    ax1.set_title(f"Accuracy — {run_name}")
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
-
-    ax2.plot(epochs, history["train_loss"], label="Train")
-    ax2.plot(epochs, history["test_loss"], label="Test")
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Loss")
-    ax2.set_title(f"Loss — {run_name}")
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
-
-    fig.tight_layout()
-    plt.savefig(f"training_curves_{run_name}.png", dpi=150, bbox_inches="tight")
-    print(f"Saved training_curves_{run_name}.png and history_{run_name}.json")
-
-    # Plot weight distributions: init vs final
-    final_weights = {name: param.detach().cpu()
-                     for name, param in model.named_parameters() if param.requires_grad}
-    param_names = list(init_weights.keys())
-    n = len(param_names)
-    fig2, axes = plt.subplots(n, 1, figsize=(8, 3 * n))
-    if n == 1:
-        axes = [axes]
-    for ax, name in zip(axes, param_names):
-        ax.hist(init_weights[name].numpy().ravel(), bins=60, alpha=0.6, label="Init", density=True)
-        ax.hist(final_weights[name].numpy().ravel(), bins=60, alpha=0.6, label="Trained", density=True)
-        ax.set_title(name)
-        ax.set_xlabel("Weight value")
-        ax.set_ylabel("Density")
-        ax.legend()
-        ax.grid(True, alpha=0.3)
-    fig2.suptitle(f"Weight distributions — {run_name}", fontsize=13)
-    fig2.tight_layout()
-    plt.savefig(f"weight_distributions_{run_name}.png", dpi=150, bbox_inches="tight")
-    print(f"Saved weight_distributions_{run_name}.png")
+    print(f"\nDone. Best test accuracy: {best_acc:.2f}%")
 
 
 if __name__ == "__main__":
