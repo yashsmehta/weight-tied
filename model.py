@@ -72,8 +72,11 @@ class DivisiveNorm(nn.Module):
         return F.softplus(self.log_sigma)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        energy = F.avg_pool2d(x.pow(2), self.kernel_size, stride=1, padding=self.padding)
-        return x / (self.sigma + energy.sqrt() + self.eps)
+        # Compute squared energy in float32 to prevent float16 overflow under AMP.
+        # In float16, any activation > ~256 causes x.pow(2) to overflow to inf,
+        # which collapses all outputs to zero and cascades into NaN weights.
+        energy = F.avg_pool2d(x.float().pow(2), self.kernel_size, stride=1, padding=self.padding)
+        return x / (self.sigma.to(x.dtype) + energy.sqrt().to(x.dtype) + self.eps)
 
 
 class BlurPool2d(nn.Module):
