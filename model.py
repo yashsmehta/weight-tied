@@ -72,11 +72,14 @@ class DivisiveNorm(nn.Module):
         return F.softplus(self.log_sigma)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Compute squared energy in float32 to prevent float16 overflow under AMP.
-        # In float16, any activation > ~256 causes x.pow(2) to overflow to inf,
-        # which collapses all outputs to zero and cascades into NaN weights.
-        energy = F.avg_pool2d(x.float().pow(2), self.kernel_size, stride=1, padding=self.padding)
-        return x / (self.sigma.to(x.dtype) + energy.sqrt().to(x.dtype) + self.eps)
+        # Run entirely in float32 to prevent AMP float16 overflow in both
+        # the forward pass (x.pow(2) overflow at |x|>256) and the backward
+        # pass (reciprocal of small denominator can overflow in float16).
+        # Only the final output is cast back to the original dtype.
+        x_f32 = x.float()
+        energy = F.avg_pool2d(x_f32.pow(2), self.kernel_size, stride=1, padding=self.padding)
+        out = x_f32 / (self.sigma.float() + energy.sqrt() + self.eps)
+        return out.to(x.dtype)
 
 
 class BlurPool2d(nn.Module):
@@ -230,9 +233,18 @@ def divisive_norm_params(model: nn.Module):
     """Return log_sigma parameters separately for reduced-LR optimiser group."""
     return [p for n, p in model.named_parameters() if 'log_sigma' in n]
 
+def gamma_params(model: nn.Module):
+    """Return LayerScale gamma parameters for very-low-LR group.
+    Gamma accumulates gradients from all N block iterations so its
+    effective gradient is N times larger than other parameters.
+    Without a separate low LR, gamma grows 20x in the first epoch
+    and causes the block contribution to explode recursively."""
+    return [p for n, p in model.named_parameters() if 'gamma' in n]
+
 def main_params(model: nn.Module):
-    """Return all parameters except log_sigma."""
-    return [p for n, p in model.named_parameters() if 'log_sigma' not in n]
+    """Return all parameters except log_sigma and gamma."""
+    return [p for n, p in model.named_parameters()
+            if 'log_sigma' not in n and 'gamma' not in n]
 
 
 # Capacity sweep

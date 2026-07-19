@@ -39,7 +39,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from model import ECTiedNet, count_parameters, divisive_norm_params, main_params
+from model import ECTiedNet, count_parameters, divisive_norm_params, gamma_params, main_params
 
 
 # ============================================================================
@@ -151,14 +151,17 @@ def main():
     # Training
     parser.add_argument('--epochs',          type=int,   default=200)
     parser.add_argument('--batch-size',      type=int,   default=128)
-    parser.add_argument('--lr',              type=float, default=0.1)
+    parser.add_argument('--lr',              type=float, default=0.01)
     parser.add_argument('--weight-decay',    type=float, default=5e-4)
     parser.add_argument('--warmup-epochs',   type=int,   default=5)
     parser.add_argument('--label-smoothing', type=float, default=0.0)
     parser.add_argument('--sigma-lr-scale',  type=float, default=0.1,
-                        help='LR multiplier for DivisiveNorm log_sigma. '
-                             'Keeps sigma stable when block is reused N times '
-                             '(each reuse accumulates a gradient contribution).')
+                        help='LR multiplier for DivisiveNorm log_sigma.')
+    parser.add_argument('--gamma-lr-scale',  type=float, default=0.01,
+                        help='LR multiplier for LayerScale gamma. '
+                             'Gamma accumulates gradients from all N block '
+                             'iterations so without a reduced LR it grows '
+                             '~20x in the first epoch and destabilises training.')
 
     # Checkpointing
     parser.add_argument('--save-dir',   type=str, default='checkpoints')
@@ -188,12 +191,17 @@ def main():
     ).to(device)
     print(f"Parameters: {count_parameters(model):,}\n")
 
-    # Separate parameter groups: reduced LR for DivisiveNorm sigma
+    # Three parameter groups:
+    #   main   — conv weights, norms  → full lr
+    #   sigma  — DivisiveNorm sigma   → 0.1x lr (large per-iteration grad)
+    #   gamma  — LayerScale gamma     → 0.01x lr (accumulates N×grad, grows 20x/epoch)
     sigma_params = divisive_norm_params(model)
+    g_params     = gamma_params(model)
     other_params = main_params(model)
     optimizer = optim.SGD([
         {'params': other_params, 'lr': args.lr},
         {'params': sigma_params, 'lr': args.lr * args.sigma_lr_scale},
+        {'params': g_params,     'lr': args.lr * args.gamma_lr_scale},
     ], momentum=0.9, weight_decay=args.weight_decay)
 
     # LambdaLR: linear warmup then cosine decay
@@ -209,7 +217,7 @@ def main():
     scaler    = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-    # Keep a reference to main params for targeted gradient clipping
+    # Clip only main params — sigma/gamma have their own reduced LRs
     main_param_list = other_params
 
     # Resume
