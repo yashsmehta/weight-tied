@@ -82,7 +82,7 @@ def get_dataloaders(batch_size: int = 128, num_workers: int = 4):
 # Training and Evaluation
 # ============================================================================
 
-def train_epoch(model, loader, optimizer, scaler, criterion, device, main_param_list):
+def train_epoch(model, loader, optimizer, scaler, criterion, device, main_param_list, use_amp=True):
     """
     Train for one epoch. Returns (avg_loss, accuracy %).
     Clips gradients on main parameters only — log_sigma excluded so its
@@ -96,7 +96,7 @@ def train_epoch(model, loader, optimizer, scaler, criterion, device, main_param_
 
         optimizer.zero_grad()
 
-        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             outputs = model(inputs)
             loss    = criterion(outputs, targets)
 
@@ -117,7 +117,7 @@ def train_epoch(model, loader, optimizer, scaler, criterion, device, main_param_
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device):
+def evaluate(model, loader, criterion, device, use_amp=True):
     """Evaluate on test set. Returns (avg_loss, accuracy %)."""
     model.eval()
     total_loss, correct, total = 0.0, 0, 0
@@ -125,7 +125,7 @@ def evaluate(model, loader, criterion, device):
     for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
 
-        with torch.amp.autocast('cuda', enabled=device.type == 'cuda'):
+        with torch.amp.autocast('cuda', enabled=use_amp):
             outputs = model(inputs)
             loss    = criterion(outputs, targets)
 
@@ -171,6 +171,10 @@ def main():
     # Misc
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--seed',        type=int, default=42)
+    parser.add_argument('--no-amp',      action='store_true',
+                        help='Disable mixed precision. Recommended for CIFAR-10: '
+                             'float16 depthwise conv weights overflow into '
+                             'inf after training, causing GroupNorm NaN.')
 
     args = parser.parse_args()
 
@@ -214,7 +218,8 @@ def main():
         return 0.5 * (1.0 + math.cos(math.pi * progress))
 
     scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    scaler    = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
+    use_amp   = (device.type == 'cuda') and not args.no_amp
+    scaler    = torch.amp.GradScaler('cuda', enabled=use_amp)
     criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
     # Clip only main params — sigma/gamma have their own reduced LRs
@@ -237,9 +242,10 @@ def main():
         lr = optimizer.param_groups[0]['lr']
 
         train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scaler, criterion, device, main_param_list
+            model, train_loader, optimizer, scaler, criterion, device, main_param_list,
+            use_amp=use_amp,
         )
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device, use_amp=use_amp)
         scheduler.step()
 
         # NaN detection — halt rather than running on a broken model
