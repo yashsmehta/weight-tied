@@ -49,20 +49,23 @@ class DivisiveNorm(nn.Module):
 
     Each activation is divided by the RMS energy of its local spatial
     neighbourhood, implementing the surround suppression observed in V1.
-    sigma is a learnable per-channel semi-saturation constant, corresponding
-    directly to the sigma parameter in the Carandini & Heeger model.
+    sigma is a learnable per-channel semi-saturation constant.
+
+    eps is set to 1e-3 (not 1e-6) to prevent the denominator collapsing
+    to near-zero when sigma is small early in training — which would amplify
+    activations and cause loss spikes in a recursively-applied block.
 
     Applied only after the depthwise (spatial) convolution step — not after
-    1×1 pointwise steps, which have no spatial footprint and do not benefit
-    from spatial suppression.
+    1x1 pointwise steps, which have no spatial footprint.
     """
-    def __init__(self, num_channels: int, kernel_size: int = 3, eps: float = 1e-6):
+    def __init__(self, num_channels: int, kernel_size: int = 3, eps: float = 1e-3):
         super().__init__()
         self.eps         = eps
         self.kernel_size = kernel_size
         self.padding     = kernel_size // 2
-        # Learnable semi-saturation constant, one per channel, always positive
-        self.log_sigma   = nn.Parameter(torch.zeros(1, num_channels, 1, 1))
+        # Initialised to 1.0 so sigma = softplus(1) ≈ 1.31 at step 0,
+        # providing meaningful suppression before sigma is learned.
+        self.log_sigma   = nn.Parameter(torch.ones(1, num_channels, 1, 1))
 
     @property
     def sigma(self) -> torch.Tensor:
@@ -79,7 +82,7 @@ class BlurPool2d(nn.Module):
 
     Applies a fixed binomial blur kernel before strided subsampling,
     preserving shift-equivariance that standard strided convolutions destroy.
-    Kernel [1,2,1]×[1,2,1] (normalised) registered as a non-learned buffer.
+    Kernel [1,2,1]x[1,2,1] (normalised) registered as a non-learned buffer.
     """
     def __init__(self, channels: int, stride: int = 2):
         super().__init__()
@@ -98,36 +101,32 @@ class ECBlock(nn.Module):
     Expand-Contract block — the weight-shared building block.
 
     Structure per forward call:
-        Expand:   1×1 conv → GroupNorm → SiLU       (channel mixing)
-        Process:  3×3 dw conv (dil=d) → DivisiveNorm → SiLU  (spatial)
-        Contract: 1×1 conv → GroupNorm               (channel mixing)
-        Residual: x + gamma × out                    (LayerScale)
+        Expand:   1x1 conv -> GroupNorm -> SiLU       (channel mixing)
+        Process:  3x3 dw conv (dil=d) -> DivisiveNorm -> SiLU  (spatial)
+        Contract: 1x1 conv -> GroupNorm               (channel mixing)
+        Residual: x + gamma * out                     (LayerScale)
 
-    Normalisation choice rationale:
-        GroupNorm on expand/contract — these are 1×1 pointwise convolutions
-        with no spatial footprint; spatial suppression (DivisiveNorm) is not
-        meaningful here and GroupNorm is more stable for channel mixing.
-        DivisiveNorm only after the spatial depthwise step — this is the only
-        operation with a spatial neighbourhood, mapping onto cortical surround
-        inhibition mediated by local horizontal connections.
+    Normalisation rationale:
+        GroupNorm on expand/contract — 1x1 convolutions have no spatial
+        footprint; spatial suppression (DivisiveNorm) is not meaningful here.
+        DivisiveNorm only after the spatial depthwise step, mapping onto
+        cortical surround inhibition via horizontal connections.
 
     LayerScale (gamma):
-        Initialises the residual branch contribution near zero (gamma ≈ 1e-3).
-        Prevents large perturbations from randomly-initialised weights when the
-        block is applied 6 times in sequence. gamma is learned and grows during
-        training, providing an implicit warm-start without requiring a long LR
-        warmup to compensate for recursive noise accumulation.
+        Initialises the residual branch near zero so recursive application
+        of the block is stable at the start of training. gamma grows during
+        training as the block learns useful representations.
 
     SiLU via F.silu():
-        Activations are applied with F.silu() rather than a shared nn.SiLU
-        module to avoid autograd version-counter issues that arise when the
-        same inplace module is called at two different points in the graph.
+        Applied with F.silu() rather than a shared nn.SiLU(inplace=True)
+        module to avoid autograd version-counter issues when the same
+        activation is called at two graph nodes.
     """
     def __init__(self, channels: int, expansion: int = 4, layer_scale: float = 1e-3):
         super().__init__()
         hidden = channels * expansion
 
-        # Expand: channel mixing, GroupNorm appropriate (no spatial footprint)
+        # Expand: channel mixing
         self.expand = nn.Conv2d(channels, hidden, 1, bias=False)
         self.norm1  = nn.GroupNorm(gn_groups(hidden), hidden)
 
@@ -137,7 +136,7 @@ class ECBlock(nn.Module):
         nn.init.kaiming_normal_(self.dw_weight, mode='fan_out', nonlinearity='relu')
         self.divnorm   = DivisiveNorm(hidden)
 
-        # Contract: channel mixing, GroupNorm appropriate (no spatial footprint)
+        # Contract: channel mixing
         self.contract = nn.Conv2d(hidden, channels, 1, bias=False)
         self.norm2    = nn.GroupNorm(gn_groups(channels), channels)
 
@@ -147,17 +146,14 @@ class ECBlock(nn.Module):
     def forward(self, x: torch.Tensor, dilation: int = 1) -> torch.Tensor:
         identity = x
 
-        # Expand (channel mixing)
         out = F.silu(self.norm1(self.expand(x)))
 
-        # Process (spatial, dilation varies per iteration)
         out = F.conv2d(
             out, self.dw_weight, self.dw_bias,
             padding=dilation, dilation=dilation, groups=out.shape[1],
         )
         out = F.silu(self.divnorm(out))
 
-        # Contract (channel mixing, no activation — follows MobileNetV2)
         out = self.norm2(self.contract(out))
 
         return identity + self.gamma * out
@@ -174,22 +170,14 @@ class ECTiedNet(nn.Module):
     One ECBlock is instantiated and reused N times. The dilation schedule
     [1, 1, 2, 1, 2, 3] varies the spatial scale processed at each iteration
     while keeping weights identical — a computational model of the temporally
-    expanding extra-classical receptive field (eCRF) in visual cortex:
-
-        Iterations 1–2  (dilation 1): near-surround integration
-                                       → horizontal connections within V1
-        Iterations 3, 5 (dilation 2): intermediate surround
-                                       → onset of feedback from V2/V4
-        Iteration  4    (dilation 1): local consolidation between feedback waves
-        Iteration  6    (dilation 3): far-surround integration
-                                       → long-range feedback from higher areas
+    expanding extra-classical receptive field (eCRF) in visual cortex.
 
     BlurPool is inserted at the iteration midpoint so the block explicitly
-    processes two spatial scales: full resolution for the first half of
-    iterations, half resolution for the second half.
+    processes two spatial scales: full resolution for the first half,
+    half resolution for the second half.
 
     Architecture:
-        Stem  →  [ECBlock × 3]  →  BlurPool  →  [ECBlock × 3]  →  GAP  →  head
+        Stem -> [ECBlock x 3] -> BlurPool -> [ECBlock x 3] -> GAP -> head
     """
     def __init__(
         self,
@@ -204,21 +192,15 @@ class ECTiedNet(nn.Module):
         self.num_iterations = len(self.dilations)
         self.downsample_at  = self.num_iterations // 2 - 1
 
-        # Stem: project RGB to feature channels
         self.stem = nn.Sequential(
             nn.Conv2d(3, channels, 3, padding=1, bias=False),
             nn.GroupNorm(gn_groups(channels), channels),
             nn.SiLU(inplace=True),
         )
 
-        # The one shared block — called num_iterations times in forward()
         self.block = ECBlock(channels, expansion=expansion)
-
-        # BlurPool inserted at the midpoint of iterations
-        self.blur = BlurPool2d(channels, stride=2)
-
-        # Classification head
-        self.head = nn.Linear(channels, num_classes)
+        self.blur  = BlurPool2d(channels, stride=2)
+        self.head  = nn.Linear(channels, num_classes)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.stem(x)
@@ -228,7 +210,7 @@ class ECTiedNet(nn.Module):
             if t == self.downsample_at:
                 x = self.blur(x)
 
-        x = x.mean(dim=(2, 3))   # global average pool
+        x = x.mean(dim=(2, 3))
         return self.head(x)
 
 
@@ -241,7 +223,16 @@ def count_parameters(model: nn.Module) -> int:
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-# Capacity sweep — channel width is the single knob
+def divisive_norm_params(model: nn.Module):
+    """Return log_sigma parameters separately for reduced-LR optimiser group."""
+    return [p for n, p in model.named_parameters() if 'log_sigma' in n]
+
+def main_params(model: nn.Module):
+    """Return all parameters except log_sigma."""
+    return [p for n, p in model.named_parameters() if 'log_sigma' not in n]
+
+
+# Capacity sweep
 def ectiednet_tiny(num_classes: int = 10, **kwargs) -> ECTiedNet:
     """~38K parameters. Baseline spec."""
     return ECTiedNet(num_classes=num_classes, channels=64,  expansion=4, **kwargs)
@@ -262,13 +253,7 @@ def ectiednet_medium(num_classes: int = 10, **kwargs) -> ECTiedNet:
 if __name__ == "__main__":
     print("ECTiedNet — capacity sweep\n")
     x = torch.randn(2, 3, 32, 32)
-
-    for name, fn in [
-        ("tiny",   ectiednet_tiny),
-        ("small",  ectiednet_small),
-        ("medium", ectiednet_medium),
-    ]:
+    for name, fn in [("tiny", ectiednet_tiny), ("small", ectiednet_small), ("medium", ectiednet_medium)]:
         model = fn(num_classes=10)
         y = model(x)
-        print(f"ectiednet_{name:6s}  params: {count_parameters(model):>9,}   "
-              f"{list(x.shape)} -> {list(y.shape)}")
+        print(f"ectiednet_{name:6s}  params: {count_parameters(model):>9,}   {list(x.shape)} -> {list(y.shape)}")

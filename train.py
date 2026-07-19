@@ -3,45 +3,34 @@ Training script for ECTiedNet on CIFAR-10.
 
 Usage
 -----
-    # Baseline run
-    python train.py
-
-    # Custom width and longer schedule
-    python train.py --channels 128 --epochs 300
-
-    # Resume from checkpoint
+    python train.py                           # defaults
+    python train.py --channels 128            # wider model
     python train.py --resume checkpoints/best.pt
 
-Training additions over a plain SGD loop
------------------------------------------
-AMP (mixed precision):
-    Forward and loss computed in float16; weights updated in float32.
-    Negligible accuracy cost; significant speedup on modern GPUs.
+Key training decisions
+----------------------
+Separate LR for DivisiveNorm sigma:
+    log_sigma accumulates gradients from all N block iterations (one per
+    call), making its effective gradient N times larger than other parameters.
+    A separate, lower LR (--sigma-lr-scale, default 0.1x) prevents sigma
+    from oscillating and dragging the loss into a spike-then-NaN trajectory.
 
-Gradient clipping (max_norm=1.0):
-    The same weights accumulate gradients from all N iterations of the shared
-    block — the gradient w.r.t. W is the sum of N per-iteration terms, which
-    can be substantially larger than a single-layer gradient. Clipping prevents
-    any one destabilising update. LayerScale in ECBlock provides complementary
-    protection by keeping early residual contributions near zero.
+Gradient clipping applied to main params only:
+    log_sigma is excluded from the clip budget. When included, its large
+    gradient norm dominates the global norm and forces the actual conv weights
+    to be under-updated (most of the clip scaling is spent on sigma).
 
-LR warmup (5 epochs, linear):
-    Ramps LR from 10% of its target to full value before cosine decay begins.
-    At random initialisation, recursive block application compounds noise across
-    iterations; small early updates reduce the chance of an unlucky large step
-    setting the shared weights onto a poor trajectory.
+LR warmup (LambdaLR):
+    Ramps LR from 0 to full value over --warmup-epochs. Implemented with
+    LambdaLR rather than SequentialLR to avoid PyTorch's off-by-one
+    scheduler step warning and the associated unpredictable LR at epoch 0.
 
-Label smoothing:
-    Off by default (0.0) for CIFAR-10 development; set to 0.1 for ImageNet.
-    Prevents overconfident predictions and keeps gradients informative late
-    in training when the model would otherwise coast on saturated softmax outputs.
-
-Checkpointing:
-    Saves full training state (model, optimiser, scheduler, scaler) every
-    --save-every epochs and whenever a new best accuracy is reached. Pass
-    --resume <path> to continue an interrupted run without losing progress.
+NaN detection:
+    Training halts immediately if loss becomes NaN or Inf, saving the last
+    valid checkpoint rather than running indefinitely on a broken model.
 """
 import argparse
+import math
 import os
 
 import torch
@@ -50,7 +39,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from model import ECTiedNet, count_parameters
+from model import ECTiedNet, count_parameters, divisive_norm_params, main_params
 
 
 # ============================================================================
@@ -62,7 +51,7 @@ def get_dataloaders(batch_size: int = 128, num_workers: int = 4):
     CIFAR-10 train/test loaders with standard augmentation.
 
     Train: RandomCrop(32, padding=4) + RandomHorizontalFlip + Normalize
-    Test:  Normalize only (no augmentation)
+    Test:  Normalize only
     """
     mean = (0.4914, 0.4822, 0.4465)
     std  = (0.2470, 0.2435, 0.2616)
@@ -93,8 +82,12 @@ def get_dataloaders(batch_size: int = 128, num_workers: int = 4):
 # Training and Evaluation
 # ============================================================================
 
-def train_epoch(model, loader, optimizer, scaler, criterion, device):
-    """Train for one epoch. Returns (avg_loss, accuracy %)."""
+def train_epoch(model, loader, optimizer, scaler, criterion, device, main_param_list):
+    """
+    Train for one epoch. Returns (avg_loss, accuracy %).
+    Clips gradients on main parameters only — log_sigma excluded so its
+    large per-iteration gradient accumulation does not consume the clip budget.
+    """
     model.train()
     total_loss, correct, total = 0.0, 0, 0
 
@@ -108,10 +101,10 @@ def train_epoch(model, loader, optimizer, scaler, criterion, device):
             loss    = criterion(outputs, targets)
 
         scaler.scale(loss).backward()
-
-        # Unscale before clipping so clip threshold is in the original gradient scale
         scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+        # Clip main params only — log_sigma has its own reduced LR instead
+        torch.nn.utils.clip_grad_norm_(main_param_list, max_norm=1.0)
 
         scaler.step(optimizer)
         scaler.update()
@@ -151,9 +144,9 @@ def main():
     parser = argparse.ArgumentParser(description='Train ECTiedNet on CIFAR-10')
 
     # Model
-    parser.add_argument('--channels',    type=int,   default=64,   help='Base channel width')
-    parser.add_argument('--expansion',   type=int,   default=4,    help='Block expansion ratio')
-    parser.add_argument('--iterations',  type=int,   default=6,    help='Block reuse count')
+    parser.add_argument('--channels',      type=int,   default=64)
+    parser.add_argument('--expansion',     type=int,   default=4)
+    parser.add_argument('--iterations',    type=int,   default=6)
 
     # Training
     parser.add_argument('--epochs',          type=int,   default=200)
@@ -161,13 +154,16 @@ def main():
     parser.add_argument('--lr',              type=float, default=0.1)
     parser.add_argument('--weight-decay',    type=float, default=5e-4)
     parser.add_argument('--warmup-epochs',   type=int,   default=5)
-    parser.add_argument('--label-smoothing', type=float, default=0.0,
-                        help='0.0 for CIFAR-10; use 0.1 for ImageNet')
+    parser.add_argument('--label-smoothing', type=float, default=0.0)
+    parser.add_argument('--sigma-lr-scale',  type=float, default=0.1,
+                        help='LR multiplier for DivisiveNorm log_sigma. '
+                             'Keeps sigma stable when block is reused N times '
+                             '(each reuse accumulates a gradient contribution).')
 
     # Checkpointing
     parser.add_argument('--save-dir',   type=str, default='checkpoints')
-    parser.add_argument('--save-every', type=int, default=50,  help='Save checkpoint every N epochs')
-    parser.add_argument('--resume',     type=str, default=None, help='Path to checkpoint to resume from')
+    parser.add_argument('--save-every', type=int, default=50)
+    parser.add_argument('--resume',     type=str, default=None)
 
     # Misc
     parser.add_argument('--num-workers', type=int, default=4)
@@ -175,7 +171,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Setup
     torch.manual_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     os.makedirs(args.save_dir, exist_ok=True)
@@ -191,27 +186,33 @@ def main():
         expansion=args.expansion,
         num_iterations=args.iterations,
     ).to(device)
-    print(f"Parameters: {count_parameters(model):,}")
+    print(f"Parameters: {count_parameters(model):,}\n")
 
-    # Loss, optimiser, LR schedule, AMP scaler
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-    optimizer = optim.SGD(model.parameters(), lr=args.lr,
-                          momentum=0.9, weight_decay=args.weight_decay)
+    # Separate parameter groups: reduced LR for DivisiveNorm sigma
+    sigma_params = divisive_norm_params(model)
+    other_params = main_params(model)
+    optimizer = optim.SGD([
+        {'params': other_params, 'lr': args.lr},
+        {'params': sigma_params, 'lr': args.lr * args.sigma_lr_scale},
+    ], momentum=0.9, weight_decay=args.weight_decay)
+
+    # LambdaLR: linear warmup then cosine decay
+    # LambdaLR is used instead of SequentialLR to avoid PyTorch's
+    # off-by-one step warning and unpredictable epoch-0 LR behaviour.
+    def lr_lambda(epoch):
+        if epoch < args.warmup_epochs:
+            return (epoch + 1) / args.warmup_epochs
+        progress = (epoch - args.warmup_epochs) / max(1, args.epochs - args.warmup_epochs)
+        return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     scaler    = torch.amp.GradScaler('cuda', enabled=device.type == 'cuda')
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
 
-    # Linear warmup → cosine decay
-    warmup_sched = optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.1, total_iters=args.warmup_epochs
-    )
-    cosine_sched = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs - args.warmup_epochs
-    )
-    scheduler = optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_sched, cosine_sched],
-        milestones=[args.warmup_epochs],
-    )
+    # Keep a reference to main params for targeted gradient clipping
+    main_param_list = other_params
 
-    # Resume from checkpoint
+    # Resume
     start_epoch, best_acc = 0, 0.0
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
@@ -221,24 +222,33 @@ def main():
         scaler.load_state_dict(ckpt['scaler'])
         start_epoch = ckpt['epoch'] + 1
         best_acc    = ckpt['best_acc']
-        print(f"Resumed from epoch {ckpt['epoch']}  (best acc so far: {best_acc:.2f}%)\n")
+        print(f"Resumed from epoch {ckpt['epoch']}  (best: {best_acc:.2f}%)\n")
 
     # Training loop
     for epoch in range(start_epoch, args.epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, optimizer, scaler, criterion, device)
-        test_loss,  test_acc  = evaluate(model, test_loader, criterion, device)
+        lr = optimizer.param_groups[0]['lr']
+
+        train_loss, train_acc = train_epoch(
+            model, train_loader, optimizer, scaler, criterion, device, main_param_list
+        )
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         scheduler.step()
+
+        # NaN detection — halt rather than running on a broken model
+        if not math.isfinite(train_loss):
+            print(f"Epoch {epoch+1:3d}: NaN/Inf loss detected — halting. "
+                  f"Last valid checkpoint saved.")
+            break
 
         is_best  = test_acc > best_acc
         best_acc = max(test_acc, best_acc)
 
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
+              f"lr={lr:.5f} | "
               f"train {train_loss:.4f} / {train_acc:.2f}% | "
               f"test {test_loss:.4f} / {test_acc:.2f}% | "
-              f"best {best_acc:.2f}%  "
-              f"{'*' if is_best else ''}")
+              f"best {best_acc:.2f}%  {'*' if is_best else ''}")
 
-        # Save checkpoint
         if is_best or (epoch + 1) % args.save_every == 0:
             ckpt = {
                 'epoch':     epoch,
