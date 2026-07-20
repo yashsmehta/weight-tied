@@ -3,9 +3,21 @@ Training script for ECTiedNet on CIFAR-10.
 
 Usage
 -----
-    python train.py                           # defaults
-    python train.py --channels 128            # wider model
-    python train.py --resume checkpoints/best.pt
+    python train.py                           # defaults (ectiednet_tiny)
+    python train.py --model small              # capacity sweep point
+    python train.py --model untied              # H4 ablation (untied control)
+    python train.py --channels 128             # override channel width for --model
+    python train.py --resume checkpoints/tiny/best.pt
+
+Model selection (--model):
+    tiny | small | medium  -> ECTiedNet (weight-shared) at the given width
+    untied                 -> UntiedECTiedNet (H4 ablation): same depth and
+                               dilation schedule, but 6 independent ECBlocks
+                               instead of 1 shared block. Defaults to
+                               channels=64 (matched to tiny), not to a
+                               parameter-matched width — see model.py.
+    Checkpoints are saved under checkpoints/<model>/ by default so runs for
+    different variants never overwrite each other.
 
 Key training decisions
 ----------------------
@@ -39,7 +51,30 @@ import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from model import ECTiedNet, count_parameters, divisive_norm_params, gamma_params, main_params
+from model import (
+    ECTiedNet,
+    UntiedECTiedNet,
+    count_parameters,
+    divisive_norm_params,
+    gamma_params,
+    main_params,
+)
+
+
+# ============================================================================
+# Model registry
+# ============================================================================
+# Maps --model names to (module class, default channel width). Default
+# channel widths mirror the capacity-sweep / ablation choices in model.py
+# (ectiednet_tiny/small/medium, untied_control) so `--model medium` gives you
+# the same architecture those factory functions would, while still letting
+# --channels/--expansion/--iterations override any of them explicitly.
+MODEL_REGISTRY = {
+    'tiny':   (ECTiedNet,       64),
+    'small':  (ECTiedNet,       128),
+    'medium': (ECTiedNet,       256),
+    'untied': (UntiedECTiedNet, 64),   # H4 ablation — width-matched to tiny
+}
 
 
 # ============================================================================
@@ -144,7 +179,14 @@ def main():
     parser = argparse.ArgumentParser(description='Train ECTiedNet on CIFAR-10')
 
     # Model
-    parser.add_argument('--channels',      type=int,   default=64)
+    parser.add_argument('--model', type=str, default='tiny',
+                        choices=list(MODEL_REGISTRY.keys()),
+                        help='tiny/small/medium = ECTiedNet (weight-shared) at that width. '
+                             'untied = UntiedECTiedNet, the H4 ablation (6 independent '
+                             'ECBlocks, width-matched to tiny by default).')
+    parser.add_argument('--channels',      type=int,   default=None,
+                        help='Override channel width. Defaults to the standard width for '
+                             '--model (tiny=64, small=128, medium=256, untied=64).')
     parser.add_argument('--expansion',     type=int,   default=4)
     parser.add_argument('--iterations',    type=int,   default=6)
 
@@ -164,7 +206,9 @@ def main():
                              '~20x in the first epoch and destabilises training.')
 
     # Checkpointing
-    parser.add_argument('--save-dir',   type=str, default='checkpoints')
+    parser.add_argument('--save-dir',   type=str, default=None,
+                        help='Defaults to checkpoints/<model>/ so different --model runs '
+                             'never overwrite each other. Pass explicitly to override.')
     parser.add_argument('--save-every', type=int, default=50)
     parser.add_argument('--resume',     type=str, default=None)
 
@@ -178,18 +222,29 @@ def main():
 
     args = parser.parse_args()
 
+    # Resolve --model into a class + default channel width. --channels, if
+    # given, overrides that default; otherwise fall back to the standard
+    # width for the chosen variant (see MODEL_REGISTRY above).
+    model_cls, default_channels = MODEL_REGISTRY[args.model]
+    channels = args.channels if args.channels is not None else default_channels
+
+    # Default save-dir is per-model so e.g. `--model untied` never clobbers
+    # `--model tiny` checkpoints when run against the same --save-dir.
+    save_dir = args.save_dir if args.save_dir is not None else os.path.join('checkpoints', args.model)
+
     torch.manual_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(args.save_dir, exist_ok=True)
-    print(f"Device: {device}\n")
+    os.makedirs(save_dir, exist_ok=True)
+    print(f"Device: {device}")
+    print(f"Model: {args.model}  ({model_cls.__name__}, channels={channels})\n")
 
     # Data
     train_loader, test_loader = get_dataloaders(args.batch_size, args.num_workers)
 
     # Model
-    model = ECTiedNet(
+    model = model_cls(
         num_classes=10,
-        channels=args.channels,
+        channels=channels,
         expansion=args.expansion,
         num_iterations=args.iterations,
     ).to(device)
@@ -274,9 +329,9 @@ def main():
                 'args':      vars(args),
             }
             if is_best:
-                torch.save(ckpt, os.path.join(args.save_dir, 'best.pt'))
+                torch.save(ckpt, os.path.join(save_dir, 'best.pt'))
             if (epoch + 1) % args.save_every == 0:
-                torch.save(ckpt, os.path.join(args.save_dir, f'epoch_{epoch+1:03d}.pt'))
+                torch.save(ckpt, os.path.join(save_dir, f'epoch_{epoch+1:03d}.pt'))
 
     print(f"\nDone. Best test accuracy: {best_acc:.2f}%")
 
