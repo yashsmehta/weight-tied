@@ -127,6 +127,21 @@ class ECBlock(nn.Module):
         Applied with F.silu() rather than a shared nn.SiLU(inplace=True)
         module to avoid autograd version-counter issues when the same
         activation is called at two graph nodes.
+
+    Depthwise conv forced to float32 (AMP safety):
+        Under AMP, casting the depthwise conv's weights to float16 can
+        overflow once |value| exceeds ~65504 after enough training,
+        producing inf *before* DivisiveNorm's own float32 upcast ever gets
+        a chance to help — by the time DivisiveNorm sees the tensor, the
+        damage is already done. Verified empirically: routing this conv
+        through a plain nn.Conv2d module makes no numerical difference
+        under autocast versus the previous raw-Parameter + F.conv2d call —
+        both hit the exact same overflow at the same weight magnitude,
+        since both dispatch to the same underlying op. The actual fix is
+        to run this specific conv outside autocast, always in float32,
+        exactly the same treatment DivisiveNorm already gets. It's kept as
+        a proper nn.Conv2d module (rather than a raw Parameter pair) purely
+        for readability — see forward().
     """
     def __init__(self, channels: int, expansion: int = 4, layer_scale: float = 1e-3):
         super().__init__()
@@ -136,11 +151,14 @@ class ECBlock(nn.Module):
         self.expand = nn.Conv2d(channels, hidden, 1, bias=False)
         self.norm1  = nn.GroupNorm(gn_groups(hidden), hidden)
 
-        # Process: spatial filtering, dilation set at forward time
-        self.dw_weight = nn.Parameter(torch.empty(hidden, 1, 3, 3))
-        self.dw_bias   = nn.Parameter(torch.zeros(hidden))
-        nn.init.kaiming_normal_(self.dw_weight, mode='fan_out', nonlinearity='relu')
-        self.divnorm   = DivisiveNorm(hidden)
+        # Process: spatial filtering. dilation/padding are mutated per
+        # forward call (see forward()) since the schedule changes them
+        # every iteration — the same pattern CORnet-S uses to mutate a
+        # conv's stride per timestep.
+        self.dw = nn.Conv2d(hidden, hidden, kernel_size=3, groups=hidden)
+        nn.init.kaiming_normal_(self.dw.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.zeros_(self.dw.bias)
+        self.divnorm = DivisiveNorm(hidden)
 
         # Contract: channel mixing
         self.contract = nn.Conv2d(hidden, channels, 1, bias=False)
@@ -154,10 +172,10 @@ class ECBlock(nn.Module):
 
         out = F.silu(self.norm1(self.expand(x)))
 
-        out = F.conv2d(
-            out, self.dw_weight, self.dw_bias,
-            padding=dilation, dilation=dilation, groups=out.shape[1],
-        )
+        self.dw.dilation = (dilation, dilation)
+        self.dw.padding  = (dilation, dilation)
+        with torch.autocast(device_type=out.device.type, enabled=False):
+            out = self.dw(out.float()).to(out.dtype)
         out = F.silu(self.divnorm(out))
 
         out = self.norm2(self.contract(out))
@@ -220,6 +238,67 @@ class ECTiedNet(nn.Module):
         return self.head(x)
 
 
+class UntiedECTiedNet(nn.Module):
+    """
+    Untied control — the H4 ablation.
+
+    Structurally identical to ECTiedNet (same stem, same dilation schedule,
+    same BlurPool midpoint placement, same GAP + head) but instantiates a
+    SEPARATE ECBlock for every iteration instead of calling one shared block
+    repeatedly. This isolates weight *tying* from iteration count / effective
+    depth: if accuracy or brain alignment differs from ECTiedNet at matched
+    width, the difference is attributable to tying itself, not to depth.
+
+    Parameter count is intentionally NOT matched to ectiednet_tiny — at the
+    same channel width, N independent blocks have ~N times the parameters of
+    one shared block (project_plan.md 3.4). The width/depth-matched capacity
+    sweep (ectiednet_small/medium) already covers the "same params, different
+    architecture" comparison; this ablation's job is to hold width and depth
+    fixed and let tying be the only variable. Its resulting parameter count
+    (~6x tiny) happens to land near the small/medium capacity-sweep points,
+    which is useful for cross-checking H3 against H4.
+    """
+    def __init__(
+        self,
+        num_classes:    int            = 10,
+        channels:       int            = 64,
+        expansion:      int            = 4,
+        num_iterations: int            = 6,
+        dilations:      list[int] | None = None,
+    ):
+        super().__init__()
+        self.dilations      = (dilations or [1, 1, 2, 1, 2, 3])[:num_iterations]
+        self.num_iterations = len(self.dilations)
+        self.downsample_at  = self.num_iterations // 2 - 1
+
+        self.stem = nn.Sequential(
+            nn.Conv2d(3, channels, 3, padding=1, bias=False),
+            nn.GroupNorm(gn_groups(channels), channels),
+            nn.SiLU(inplace=True),
+        )
+
+        # One independent ECBlock per iteration — the only structural
+        # difference from ECTiedNet, which calls a single shared block
+        # self.num_iterations times. BlurPool stays a single shared instance
+        # since it carries no learned weights, so tying is not at stake there.
+        self.blocks = nn.ModuleList([
+            ECBlock(channels, expansion=expansion) for _ in range(self.num_iterations)
+        ])
+        self.blur = BlurPool2d(channels, stride=2)
+        self.head = nn.Linear(channels, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.stem(x)
+
+        for t, dilation in enumerate(self.dilations):
+            x = self.blocks[t](x, dilation=dilation)
+            if t == self.downsample_at:
+                x = self.blur(x)
+
+        x = x.mean(dim=(2, 3))
+        return self.head(x)
+
+
 # ============================================================================
 # Utilities
 # ============================================================================
@@ -261,6 +340,16 @@ def ectiednet_medium(num_classes: int = 10, **kwargs) -> ECTiedNet:
     return ECTiedNet(num_classes=num_classes, channels=256, expansion=4, **kwargs)
 
 
+# H4 ablation
+def untied_control(num_classes: int = 10, **kwargs) -> UntiedECTiedNet:
+    """
+    Untied H4 ablation. Channel width matched to ectiednet_tiny (64) so the
+    tying comparison is width/depth-matched, not capacity-matched — see
+    UntiedECTiedNet docstring. Expect ~6x ectiednet_tiny's parameter count.
+    """
+    return UntiedECTiedNet(num_classes=num_classes, channels=64, expansion=4, **kwargs)
+
+
 # ============================================================================
 # Sanity check
 # ============================================================================
@@ -272,3 +361,22 @@ if __name__ == "__main__":
         model = fn(num_classes=10)
         y = model(x)
         print(f"ectiednet_{name:6s}  params: {count_parameters(model):>9,}   {list(x.shape)} -> {list(y.shape)}")
+
+    print("\nH4 ablation — untied control\n")
+    tiny_params = count_parameters(ectiednet_tiny(num_classes=10))
+    model = untied_control(num_classes=10)
+    y = model(x)
+    ratio = count_parameters(model) / tiny_params
+    print(f"untied_control  params: {count_parameters(model):>9,}   "
+          f"{list(x.shape)} -> {list(y.shape)}   ({ratio:.2f}x tiny)")
+
+    # Sanity: param-group helpers should partition ALL params with no overlap,
+    # and should pick up gamma/log_sigma correctly across the ModuleList too.
+    sigma_p = divisive_norm_params(model)
+    gamma_p = gamma_params(model)
+    main_p  = main_params(model)
+    total_via_groups = sum(p.numel() for p in sigma_p + gamma_p + main_p)
+    assert total_via_groups == count_parameters(model), "param-group helpers dropped or double-counted params"
+    assert len(gamma_p) == model.num_iterations, "expected one gamma per (independent) block"
+    print(f"param groups OK: main={sum(p.numel() for p in main_p):,}  "
+          f"sigma={sum(p.numel() for p in sigma_p):,}  gamma={len(gamma_p)} scalars")
