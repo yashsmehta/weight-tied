@@ -216,9 +216,12 @@ def main():
     parser.add_argument('--num-workers', type=int, default=4)
     parser.add_argument('--seed',        type=int, default=42)
     parser.add_argument('--no-amp',      action='store_true',
-                        help='Disable mixed precision. Recommended for CIFAR-10: '
-                             'float16 depthwise conv weights overflow into '
-                             'inf after training, causing GroupNorm NaN.')
+                        help='Disable mixed precision entirely. As of the AMP audit, '
+                             'ECBlock\'s depthwise conv always runs in float32 '
+                             'internally regardless of this flag (that\'s what fixed '
+                             'the CIFAR-10 overflow-to-inf issue) — AMP should now be '
+                             'safe to leave on. This flag remains for the rare case '
+                             'you want to rule AMP out entirely while debugging.')
 
     args = parser.parse_args()
 

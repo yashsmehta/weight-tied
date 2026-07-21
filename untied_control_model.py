@@ -127,6 +127,21 @@ class ECBlock(nn.Module):
         Applied with F.silu() rather than a shared nn.SiLU(inplace=True)
         module to avoid autograd version-counter issues when the same
         activation is called at two graph nodes.
+
+    Depthwise conv forced to float32 (AMP safety):
+        Under AMP, casting the depthwise conv's weights to float16 can
+        overflow once |value| exceeds ~65504 after enough training,
+        producing inf *before* DivisiveNorm's own float32 upcast ever gets
+        a chance to help — by the time DivisiveNorm sees the tensor, the
+        damage is already done. Verified empirically: routing this conv
+        through a plain nn.Conv2d module makes no numerical difference
+        under autocast versus the previous raw-Parameter + F.conv2d call —
+        both hit the exact same overflow at the same weight magnitude,
+        since both dispatch to the same underlying op. The actual fix is
+        to run this specific conv outside autocast, always in float32,
+        exactly the same treatment DivisiveNorm already gets. It's kept as
+        a proper nn.Conv2d module (rather than a raw Parameter pair) purely
+        for readability — see forward().
     """
     def __init__(self, channels: int, expansion: int = 4, layer_scale: float = 1e-3):
         super().__init__()
@@ -136,11 +151,14 @@ class ECBlock(nn.Module):
         self.expand = nn.Conv2d(channels, hidden, 1, bias=False)
         self.norm1  = nn.GroupNorm(gn_groups(hidden), hidden)
 
-        # Process: spatial filtering, dilation set at forward time
-        self.dw_weight = nn.Parameter(torch.empty(hidden, 1, 3, 3))
-        self.dw_bias   = nn.Parameter(torch.zeros(hidden))
-        nn.init.kaiming_normal_(self.dw_weight, mode='fan_out', nonlinearity='relu')
-        self.divnorm   = DivisiveNorm(hidden)
+        # Process: spatial filtering. dilation/padding are mutated per
+        # forward call (see forward()) since the schedule changes them
+        # every iteration — the same pattern CORnet-S uses to mutate a
+        # conv's stride per timestep.
+        self.dw = nn.Conv2d(hidden, hidden, kernel_size=3, groups=hidden)
+        nn.init.kaiming_normal_(self.dw.weight, mode='fan_out', nonlinearity='relu')
+        nn.init.zeros_(self.dw.bias)
+        self.divnorm = DivisiveNorm(hidden)
 
         # Contract: channel mixing
         self.contract = nn.Conv2d(hidden, channels, 1, bias=False)
@@ -154,10 +172,10 @@ class ECBlock(nn.Module):
 
         out = F.silu(self.norm1(self.expand(x)))
 
-        out = F.conv2d(
-            out, self.dw_weight, self.dw_bias,
-            padding=dilation, dilation=dilation, groups=out.shape[1],
-        )
+        self.dw.dilation = (dilation, dilation)
+        self.dw.padding  = (dilation, dilation)
+        with torch.autocast(device_type=out.device.type, enabled=False):
+            out = self.dw(out.float()).to(out.dtype)
         out = F.silu(self.divnorm(out))
 
         out = self.norm2(self.contract(out))
