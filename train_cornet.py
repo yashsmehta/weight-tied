@@ -16,16 +16,20 @@ Installation
 
 Usage
 -----
-    python train_cornet.py --model rt --data-path /path/to/imagenet
-    python train_cornet.py --model s  --data-path /path/to/imagenet --epochs 100
-    python train_cornet.py --resume checkpoints/cornet_rt/best.pt --model rt --data-path ...
+    python train_cornet.py --model rt --train-path /path/to/imagenet/train --val-path /path/to/imagenet/val
+    python train_cornet.py --model s  --train-path ... --val-path ... --epochs 100
+    python train_cornet.py --resume checkpoints/cornet_rt/best.pt --model rt --train-path ... --val-path ...
 
 Data layout
 -----------
-Expects the standard torchvision ImageFolder layout:
-    <data-path>/train/<class>/*.JPEG
-    <data-path>/val/<class>/*.JPEG
-(matches the original CORnet repo's own data-prep instructions)
+Expects two independent directories, each in standard torchvision
+ImageFolder layout (one folder per class):
+    <train-path>/<class>/*.JPEG
+    <val-path>/<class>/*.JPEG
+--train-path and --val-path do NOT need to share a parent directory —
+this project's dataset keeps them as two separate top-level folders
+(e.g. .../imagenet and .../imagenet-1k-validation), so no train/val
+subfolder nesting is assumed.
 
 Model selection (--model): z | s | rt | r
     z, s, rt map directly to CORnet_Z / CORnet_S / CORnet_RT.
@@ -138,9 +142,14 @@ def count_parameters(model: nn.Module) -> int:
 # Data Loading
 # ============================================================================
 
-def get_dataloaders(data_path: str, batch_size: int = 256, num_workers: int = 8):
+def get_dataloaders(train_path: str, val_path: str, batch_size: int = 256, num_workers: int = 8):
     """
-    ImageNet-1k train/val loaders, standard ImageFolder layout.
+    ImageNet-1k train/val loaders, standard ImageFolder layout (one folder
+    per class under each path). train_path and val_path are independent —
+    this project's dataset happens to keep them as two separate top-level
+    directories (e.g. .../imagenet and .../imagenet-1k-validation) rather
+    than a shared root with train/val subfolders, so no directory-nesting
+    assumption is made here.
     Normalization matches the original CORnet repo's own preprocessing
     (torchvision ImageNet mean/std), for consistency with how CORnet was
     originally evaluated even though we're not using their training recipe.
@@ -161,8 +170,8 @@ def get_dataloaders(data_path: str, batch_size: int = 256, num_workers: int = 8)
         normalize,
     ])
 
-    train_dataset = datasets.ImageFolder(os.path.join(data_path, 'train'), train_transform)
-    val_dataset   = datasets.ImageFolder(os.path.join(data_path, 'val'),   val_transform)
+    train_dataset = datasets.ImageFolder(train_path, train_transform)
+    val_dataset   = datasets.ImageFolder(val_path,   val_transform)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
                                num_workers=num_workers, pin_memory=True)
@@ -244,8 +253,11 @@ def main():
                         help='Number of recurrent timesteps for rt/r (ignored for z/s).')
 
     # Data
-    parser.add_argument('--data-path', type=str, required=True,
-                        help='ImageNet root containing train/ and val/ subfolders.')
+    parser.add_argument('--train-path', type=str, required=True,
+                        help='ImageFolder root for training data (one folder per class).')
+    parser.add_argument('--val-path', type=str, required=True,
+                        help='ImageFolder root for validation data (one folder per class). '
+                             'Does not need to share a parent with --train-path.')
 
     # Training — same SGD + LambdaLR conventions as train.py
     parser.add_argument('--epochs',          type=int,   default=100,
@@ -284,7 +296,7 @@ def main():
     print(f"Model: cornet_{args.model}" + (f" (times={args.times})" if args.model in ('r', 'rt') else "") + "\n")
 
     # Data
-    train_loader, val_loader = get_dataloaders(args.data_path, args.batch_size, args.num_workers)
+    train_loader, val_loader = get_dataloaders(args.train_path, args.val_path, args.batch_size, args.num_workers)
 
     # Model
     model = build_model(args.model, times=args.times).to(device)
