@@ -1,80 +1,18 @@
 """
 Training script for ECTiedNet on CIFAR-10.
 
-Usage
------
-    python train.py                           # defaults (ectiednet_tiny)
-    python train.py --model small              # capacity sweep point
-    python train.py --model untied              # H4 ablation (untied control)
-    python train.py --channels 128             # override channel width for --model
-    python train.py --resume checkpoints/tiny/best.pt
-
-Model selection (--model):
-    tiny | small | medium  -> ECTiedNet (weight-shared) at the given width
-    untied                 -> UntiedECTiedNet (H4 ablation): same depth and
-                               dilation schedule, but 6 independent ECBlocks
-                               instead of 1 shared block. Defaults to
-                               channels=64 (matched to tiny), not to a
-                               parameter-matched width — see model.py.
-    Checkpoints are saved under checkpoints/<model>/ by default so runs for
-    different variants never overwrite each other.
-
-Key training decisions
-----------------------
-Separate LR for DivisiveNorm sigma:
-    log_sigma accumulates gradients from all N block iterations (one per
-    call), making its effective gradient N times larger than other parameters.
-    A separate, lower LR (--sigma-lr-scale, default 0.1x) prevents sigma
-    from oscillating and dragging the loss into a spike-then-NaN trajectory.
-
-Gradient clipping applied to main params only:
-    log_sigma is excluded from the clip budget. When included, its large
-    gradient norm dominates the global norm and forces the actual conv weights
-    to be under-updated (most of the clip scaling is spent on sigma).
-
-LR warmup (LambdaLR):
-    Ramps LR from 0 to full value over --warmup-epochs. Implemented with
-    LambdaLR rather than SequentialLR to avoid PyTorch's off-by-one
-    scheduler step warning and the associated unpredictable LR at epoch 0.
-
-NaN detection:
-    Training halts immediately if loss becomes NaN or Inf, saving the last
-    valid checkpoint rather than running indefinitely on a broken model.
+Usage:
+    python train.py                          # Train with defaults
+    python train.py --channels 96 --lr 0.05  # Custom config
 """
 import argparse
-import math
-import os
-
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 
-from model import (
-    ECTiedNet,
-    UntiedECTiedNet,
-    count_parameters,
-    divisive_norm_params,
-    gamma_params,
-    main_params,
-)
-
-
-# ============================================================================
-# Model registry
-# ============================================================================
-# Maps --model names to (module class, default channel width). Default
-# channel widths mirror the capacity-sweep / ablation choices in model.py
-# (ectiednet_tiny/small/medium, untied_control) so `--model medium` gives you
-# the same architecture those factory functions would, while still letting
-# --channels/--expansion/--iterations override any of them explicitly.
-MODEL_REGISTRY = {
-    'tiny':   (ECTiedNet,       64),
-    'small':  (ECTiedNet,       128),
-    'medium': (ECTiedNet,       256),
-    'untied': (UntiedECTiedNet, 64),   # H4 ablation — width-matched to tiny
-}
+from model import ECTiedNet, count_parameters
 
 
 # ============================================================================
@@ -83,32 +21,43 @@ MODEL_REGISTRY = {
 
 def get_dataloaders(batch_size: int = 128, num_workers: int = 4):
     """
-    CIFAR-10 train/test loaders with standard augmentation.
+    Create CIFAR-10 train/test dataloaders with standard augmentation.
 
-    Train: RandomCrop(32, padding=4) + RandomHorizontalFlip + Normalize
-    Test:  Normalize only
+    Train augmentation: RandomCrop + HorizontalFlip
+    Test: Just normalize (no augmentation)
     """
+    # CIFAR-10 channel-wise mean and std
     mean = (0.4914, 0.4822, 0.4465)
-    std  = (0.2470, 0.2435, 0.2616)
+    std = (0.2470, 0.2435, 0.2616)
 
     train_transform = transforms.Compose([
-        transforms.RandomCrop(32, padding=4),
-        transforms.RandomHorizontalFlip(),
+        transforms.RandomCrop(32, padding=4),  # Random crop with padding
+        transforms.RandomHorizontalFlip(),      # 50% chance flip
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
+
     test_transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean, std),
     ])
 
-    train_dataset = datasets.CIFAR10('./data', train=True,  download=True, transform=train_transform)
-    test_dataset  = datasets.CIFAR10('./data', train=False, download=True, transform=test_transform)
+    # Download CIFAR-10 if not present
+    train_dataset = datasets.CIFAR10(
+        root='./data', train=True, download=True, transform=train_transform
+    )
+    test_dataset = datasets.CIFAR10(
+        root='./data', train=False, download=True, transform=test_transform
+    )
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True,
-                              num_workers=num_workers, pin_memory=True)
-    test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False,
-                              num_workers=num_workers, pin_memory=True)
+    train_loader = DataLoader(
+        train_dataset, batch_size=batch_size, shuffle=True,
+        num_workers=num_workers, pin_memory=True
+    )
+    test_loader = DataLoader(
+        test_dataset, batch_size=batch_size, shuffle=False,
+        num_workers=num_workers, pin_memory=True
+    )
 
     return train_loader, test_loader
 
@@ -117,58 +66,44 @@ def get_dataloaders(batch_size: int = 128, num_workers: int = 4):
 # Training and Evaluation
 # ============================================================================
 
-def train_epoch(model, loader, optimizer, scaler, criterion, device, main_param_list, use_amp=True):
-    """
-    Train for one epoch. Returns (avg_loss, accuracy %).
-    Clips gradients on main parameters only — log_sigma excluded so its
-    large per-iteration gradient accumulation does not consume the clip budget.
-    """
+def train_epoch(model, loader, optimizer, criterion, device):
+    """Train for one epoch. Returns (loss, accuracy)."""
     model.train()
-    total_loss, correct, total = 0.0, 0, 0
+    total_loss, correct, total = 0, 0, 0
 
     for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
 
         optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
 
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            outputs = model(inputs)
-            loss    = criterion(outputs, targets)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-
-        # Clip main params only — log_sigma has its own reduced LR instead
-        torch.nn.utils.clip_grad_norm_(main_param_list, max_norm=1.0)
-
-        scaler.step(optimizer)
-        scaler.update()
-
+        # Track metrics
         total_loss += loss.item() * inputs.size(0)
-        correct    += outputs.argmax(1).eq(targets).sum().item()
-        total      += targets.size(0)
+        correct += outputs.argmax(1).eq(targets).sum().item()
+        total += targets.size(0)
 
-    return total_loss / total, 100.0 * correct / total
+    return total_loss / total, 100. * correct / total
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, use_amp=True):
-    """Evaluate on test set. Returns (avg_loss, accuracy %)."""
+def evaluate(model, loader, criterion, device):
+    """Evaluate on test set. Returns (loss, accuracy)."""
     model.eval()
-    total_loss, correct, total = 0.0, 0, 0
+    total_loss, correct, total = 0, 0, 0
 
     for inputs, targets in loader:
         inputs, targets = inputs.to(device), targets.to(device)
-
-        with torch.amp.autocast('cuda', enabled=use_amp):
-            outputs = model(inputs)
-            loss    = criterion(outputs, targets)
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
 
         total_loss += loss.item() * inputs.size(0)
-        correct    += outputs.argmax(1).eq(targets).sum().item()
-        total      += targets.size(0)
+        correct += outputs.argmax(1).eq(targets).sum().item()
+        total += targets.size(0)
 
-    return total_loss / total, 100.0 * correct / total
+    return total_loss / total, 100. * correct / total
 
 
 # ============================================================================
@@ -177,166 +112,55 @@ def evaluate(model, loader, criterion, device, use_amp=True):
 
 def main():
     parser = argparse.ArgumentParser(description='Train ECTiedNet on CIFAR-10')
-
-    # Model
-    parser.add_argument('--model', type=str, default='tiny',
-                        choices=list(MODEL_REGISTRY.keys()),
-                        help='tiny/small/medium = ECTiedNet (weight-shared) at that width. '
-                             'untied = UntiedECTiedNet, the H4 ablation (6 independent '
-                             'ECBlocks, width-matched to tiny by default).')
-    parser.add_argument('--channels',      type=int,   default=None,
-                        help='Override channel width. Defaults to the standard width for '
-                             '--model (tiny=64, small=128, medium=256, untied=64).')
-    parser.add_argument('--expansion',     type=int,   default=4)
-    parser.add_argument('--iterations',    type=int,   default=6)
-
-    # Training
-    parser.add_argument('--epochs',          type=int,   default=200)
-    parser.add_argument('--batch-size',      type=int,   default=128)
-    parser.add_argument('--lr',              type=float, default=0.01)
-    parser.add_argument('--weight-decay',    type=float, default=5e-4)
-    parser.add_argument('--warmup-epochs',   type=int,   default=5)
-    parser.add_argument('--label-smoothing', type=float, default=0.0)
-    parser.add_argument('--sigma-lr-scale',  type=float, default=0.1,
-                        help='LR multiplier for DivisiveNorm log_sigma.')
-    parser.add_argument('--gamma-lr-scale',  type=float, default=0.01,
-                        help='LR multiplier for LayerScale gamma. '
-                             'Gamma accumulates gradients from all N block '
-                             'iterations so without a reduced LR it grows '
-                             '~20x in the first epoch and destabilises training.')
-
-    # Checkpointing
-    parser.add_argument('--save-dir',   type=str, default=None,
-                        help='Defaults to checkpoints/<model>/ so different --model runs '
-                             'never overwrite each other. Pass explicitly to override.')
-    parser.add_argument('--save-every', type=int, default=50)
-    parser.add_argument('--resume',     type=str, default=None)
-
-    # Misc
-    parser.add_argument('--num-workers', type=int, default=4)
-    parser.add_argument('--seed',        type=int, default=42)
-    parser.add_argument('--no-amp',      action='store_true',
-                        help='Disable mixed precision entirely. As of the AMP audit, '
-                             'ECBlock\'s depthwise conv always runs in float32 '
-                             'internally regardless of this flag (that\'s what fixed '
-                             'the CIFAR-10 overflow-to-inf issue) — AMP should now be '
-                             'safe to leave on. This flag remains for the rare case '
-                             'you want to rule AMP out entirely while debugging.')
-
+    parser.add_argument('--epochs', type=int, default=200)
+    parser.add_argument('--batch-size', type=int, default=128)
+    parser.add_argument('--lr', type=float, default=0.1)
+    parser.add_argument('--channels', type=int, default=64, help='Base channel width')
+    parser.add_argument('--iterations', type=int, default=6, help='Block reuse count')
+    parser.add_argument('--expansion', type=int, default=4, help='Expansion ratio')
+    parser.add_argument('--seed', type=int, default=42)
     args = parser.parse_args()
 
-    # Resolve --model into a class + default channel width. --channels, if
-    # given, overrides that default; otherwise fall back to the standard
-    # width for the chosen variant (see MODEL_REGISTRY above).
-    model_cls, default_channels = MODEL_REGISTRY[args.model]
-    channels = args.channels if args.channels is not None else default_channels
-
-    # Default save-dir is per-model so e.g. `--model untied` never clobbers
-    # `--model tiny` checkpoints when run against the same --save-dir.
-    save_dir = args.save_dir if args.save_dir is not None else os.path.join('checkpoints', args.model)
-
+    # Setup
     torch.manual_seed(args.seed)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    os.makedirs(save_dir, exist_ok=True)
     print(f"Device: {device}")
-    print(f"Model: {args.model}  ({model_cls.__name__}, channels={channels})\n")
 
     # Data
-    train_loader, test_loader = get_dataloaders(args.batch_size, args.num_workers)
+    train_loader, test_loader = get_dataloaders(args.batch_size)
 
     # Model
-    model = model_cls(
+    model = ECTiedNet(
         num_classes=10,
-        channels=channels,
+        channels=args.channels,
         expansion=args.expansion,
         num_iterations=args.iterations,
     ).to(device)
-    print(f"Parameters: {count_parameters(model):,}\n")
+    print(f"Parameters: {count_parameters(model):,}")
 
-    # Three parameter groups:
-    #   main   — conv weights, norms  → full lr
-    #   sigma  — DivisiveNorm sigma   → 0.1x lr (large per-iteration grad)
-    #   gamma  — LayerScale gamma     → 0.01x lr (accumulates N×grad, grows 20x/epoch)
-    sigma_params = divisive_norm_params(model)
-    g_params     = gamma_params(model)
-    other_params = main_params(model)
-    optimizer = optim.SGD([
-        {'params': other_params, 'lr': args.lr},
-        {'params': sigma_params, 'lr': args.lr * args.sigma_lr_scale},
-        {'params': g_params,     'lr': args.lr * args.gamma_lr_scale},
-    ], momentum=0.9, weight_decay=args.weight_decay)
-
-    # LambdaLR: linear warmup then cosine decay
-    # LambdaLR is used instead of SequentialLR to avoid PyTorch's
-    # off-by-one step warning and unpredictable epoch-0 LR behaviour.
-    def lr_lambda(epoch):
-        if epoch < args.warmup_epochs:
-            return (epoch + 1) / args.warmup_epochs
-        progress = (epoch - args.warmup_epochs) / max(1, args.epochs - args.warmup_epochs)
-        return 0.5 * (1.0 + math.cos(math.pi * progress))
-
-    scheduler = optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    use_amp   = (device.type == 'cuda') and not args.no_amp
-    scaler    = torch.amp.GradScaler('cuda', enabled=use_amp)
-    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
-
-    # Clip only main params — sigma/gamma have their own reduced LRs
-    main_param_list = other_params
-
-    # Resume
-    start_epoch, best_acc = 0, 0.0
-    if args.resume and os.path.exists(args.resume):
-        ckpt = torch.load(args.resume, map_location=device)
-        model.load_state_dict(ckpt['model'])
-        optimizer.load_state_dict(ckpt['optimizer'])
-        scheduler.load_state_dict(ckpt['scheduler'])
-        scaler.load_state_dict(ckpt['scaler'])
-        start_epoch = ckpt['epoch'] + 1
-        best_acc    = ckpt['best_acc']
-        print(f"Resumed from epoch {ckpt['epoch']}  (best: {best_acc:.2f}%)\n")
+    # Loss, optimizer, scheduler
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=0.9, weight_decay=5e-4)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
 
     # Training loop
-    for epoch in range(start_epoch, args.epochs):
-        lr = optimizer.param_groups[0]['lr']
-
-        train_loss, train_acc = train_epoch(
-            model, train_loader, optimizer, scaler, criterion, device, main_param_list,
-            use_amp=use_amp,
-        )
-        test_loss, test_acc = evaluate(model, test_loader, criterion, device, use_amp=use_amp)
+    best_acc = 0
+    for epoch in range(args.epochs):
+        train_loss, train_acc = train_epoch(model, train_loader, optimizer, criterion, device)
+        test_loss, test_acc = evaluate(model, test_loader, criterion, device)
         scheduler.step()
 
-        # NaN detection — halt rather than running on a broken model
-        if not math.isfinite(train_loss):
-            print(f"Epoch {epoch+1:3d}: NaN/Inf loss detected — halting. "
-                  f"Last valid checkpoint saved.")
-            break
-
-        is_best  = test_acc > best_acc
-        best_acc = max(test_acc, best_acc)
+        # Save best model
+        if test_acc > best_acc:
+            best_acc = test_acc
+            torch.save(model.state_dict(), 'best_model.pth')
 
         print(f"Epoch {epoch+1:3d}/{args.epochs} | "
-              f"lr={lr:.5f} | "
-              f"train {train_loss:.4f} / {train_acc:.2f}% | "
-              f"test {test_loss:.4f} / {test_acc:.2f}% | "
-              f"best {best_acc:.2f}%  {'*' if is_best else ''}")
+              f"Train: {train_loss:.4f} / {train_acc:.2f}% | "
+              f"Test: {test_loss:.4f} / {test_acc:.2f}% | "
+              f"Best: {best_acc:.2f}%")
 
-        if is_best or (epoch + 1) % args.save_every == 0:
-            ckpt = {
-                'epoch':     epoch,
-                'model':     model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict(),
-                'scaler':    scaler.state_dict(),
-                'best_acc':  best_acc,
-                'args':      vars(args),
-            }
-            if is_best:
-                torch.save(ckpt, os.path.join(save_dir, 'best.pt'))
-            if (epoch + 1) % args.save_every == 0:
-                torch.save(ckpt, os.path.join(save_dir, f'epoch_{epoch+1:03d}.pt'))
-
-    print(f"\nDone. Best test accuracy: {best_acc:.2f}%")
+    print(f"\nDone. Best accuracy: {best_acc:.2f}%")
 
 
 if __name__ == "__main__":
