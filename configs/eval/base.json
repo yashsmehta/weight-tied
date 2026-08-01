@@ -1,0 +1,35 @@
+{
+  "_comment_log_expdata": "log_expdata defaults to false -- results print to console but are NOT saved. Pass --override log_expdata=true to persist to results.db.",
+  "_comment_checkpoint_dir": "For load_model_from=checkpoint, checkpoint.checkpoint_dir must be the FULL path used verbatim (e.g. 'model_checkpoints/ectiednet_imagenet1k_depth4'), not the bare run name train configs use -- setup_checkpoint_dir() prepends 'model_checkpoints/' on the train side, load_model() does not re-add it on the eval side.",
+
+  "mode": "eval",
+  "seed": 1,
+
+  "neural_dataset": "nsd",
+  "region": ["early visual stream", "ventral visual stream"],
+  "subject_idx": [0, 1, 2, 3, 4, 5, 6, 7],
+
+  "analysis": "rsa",
+  "compare_method": "spearman",
+  "bootstrap": false,
+  "n_bootstrap": 1000,
+  "n_select": 1000,
+
+  "batchsize": 256,
+  "num_workers": 8,
+
+  "load_model_from": "torchvision",
+  "torchvision": {
+    "model_name": "AlexNet",
+    "pretrained_dataset": "none",
+    "return_nodes": ["conv1", "conv2", "conv3", "conv4", "conv5", "fc1", "fc2"]
+  },
+  "checkpoint": {
+    "checkpoint_dir": "model_checkpoints/ectiednet_imagenet1k_depth4",
+    "cfg_id": 1000,
+    "checkpoint_model": "checkpoint_epoch_90.pth",
+    "return_nodes": ["iter1", "iter2", "iter3", "iter4", "embedding"]
+  },
+
+  "log_expdata": false
+}

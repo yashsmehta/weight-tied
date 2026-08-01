@@ -151,16 +151,32 @@ class ECTiedNet(nn.Module):
         expansion: int = 4,
         num_iterations: int = 6,
         dilations: list[int] | None = None,
+        stem: str = "cifar",
+        max_gn_groups: int = 16,
     ):
         super().__init__()
         self.num_iterations = num_iterations
 
-        # Stem: simple 3x3 for 32x32 images (no downsampling)
-        self.stem = nn.Sequential(
-            nn.Conv2d(3, channels, 3, padding=1, bias=False),
-            nn.GroupNorm(gn_groups(channels), channels),
-            nn.SiLU(inplace=True),
-        )
+        assert stem in ("cifar", "imagenet"), f"stem must be 'cifar' or 'imagenet', got '{stem}'"
+        if stem == "imagenet":
+            # 7x7 stride-2 conv + BlurPool stride-2 (224 -> 112 -> 56). The
+            # CIFAR stem below has no downsampling at all, which is only
+            # affordable at 32x32 -- at ImageNet resolution every iteration
+            # of the block would run on a full-resolution feature map.
+            self.stem = nn.Sequential(
+                nn.Conv2d(3, channels, 7, stride=2, padding=3, bias=False),
+                nn.GroupNorm(gn_groups(channels, max_gn_groups), channels),
+                nn.SiLU(inplace=True),
+            )
+            self.stem_pool = BlurPool2d(channels, stride=2)
+        else:
+            # Simple 3x3 for 32x32 images (no downsampling)
+            self.stem = nn.Sequential(
+                nn.Conv2d(3, channels, 3, padding=1, bias=False),
+                nn.GroupNorm(gn_groups(channels, max_gn_groups), channels),
+                nn.SiLU(inplace=True),
+            )
+            self.stem_pool = None
 
         # THE weight-tied block (reused num_iterations times)
         self.block = ECBlock(channels, expansion=expansion)
@@ -171,11 +187,33 @@ class ECTiedNet(nn.Module):
         # Classification head
         self.head = nn.Linear(channels, num_classes)
 
-        # Dilation schedule for multi-scale processing
-        self.dilations = (dilations or [1, 1, 2, 1, 2, 3])[:num_iterations]
+        # Dilation schedule for multi-scale processing. Cycles [1,1,2] pre-
+        # downsample / [1,2,3] post-downsample indefinitely so any depth
+        # works (reproduces the old hardcoded [1,1,2,1,2,3] exactly at N=6).
+        if dilations is None:
+            half = num_iterations // 2
+            base_pre, base_post = [1, 1, 2], [1, 2, 3]
+            dilations = (
+                [base_pre[i % len(base_pre)] for i in range(half)]
+                + [base_post[i % len(base_post)] for i in range(num_iterations - half)]
+            )
+        assert len(dilations) >= num_iterations, "Provide >= num_iterations dilations or adjust num_iterations"
+        self.dilations = dilations[:num_iterations]
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.stem(x)  # [B, C, 32, 32]
+        # Set externally to switch forward() into a dict-returning feature-
+        # extraction mode -- needed because a plain forward hook on a module
+        # called N times (the block is reused, not N separate layers) only
+        # captures the LAST call. Keys are "iter{t}" for t in 1..num_iterations
+        # plus "embedding" for the pre-head GAP output; values are the desired
+        # output dict keys.
+        self.return_nodes: dict | None = None
+
+    def forward(self, x: torch.Tensor):
+        x = self.stem(x)  # [B, C, 32, 32] (cifar) or [B, C, 112, 112] (imagenet)
+        if self.stem_pool is not None:
+            x = self.stem_pool(x)  # [B, C, 56, 56]
+
+        features = {} if self.return_nodes else None
 
         for t in range(self.num_iterations):
             # Reuse same block with different dilation
@@ -183,10 +221,21 @@ class ECTiedNet(nn.Module):
 
             # Downsample halfway through
             if t == (self.num_iterations // 2) - 1:
-                x = self.blur(x)  # [B, C, 16, 16]
+                x = self.blur(x)
 
-        x = x.mean(dim=(2, 3))  # Global average pooling -> [B, C]
-        return self.head(x)     # [B, num_classes]
+            if features is not None:
+                key = f"iter{t + 1}"
+                if key in self.return_nodes:
+                    features[self.return_nodes[key]] = x
+
+        pooled = x.mean(dim=(2, 3))  # Global average pooling -> [B, C]
+
+        if features is not None:
+            if "embedding" in self.return_nodes:
+                features[self.return_nodes["embedding"]] = pooled
+            return features
+
+        return self.head(pooled)  # [B, num_classes]
 
 
 # ============================================================================

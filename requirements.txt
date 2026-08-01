@@ -1,2 +1,17 @@
 torch>=2.0.0
 torchvision>=0.15.0
+
+# visreps-style training + RSA/encoding-score pipeline (model.py extensions,
+# trainer.py, evals.py, dataloaders/, analysis/)
+omegaconf==2.3.0
+pandas
+scipy
+xarray
+h5py
+himalaya>=0.4.9
+rich
+joblib
+python-dotenv
+wandb
+scikit-learn
+tqdm
