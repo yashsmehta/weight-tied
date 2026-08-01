@@ -83,14 +83,24 @@ class ECBlock(nn.Module):
 
     The dilation parameter allows the SAME weights to capture different
     spatial scales when the block is reused multiple times.
+
+    `untied_norm=True` gives each of the `num_iterations` calls its own
+    GroupNorm affine parameters (indexed by the `t` passed to forward) while
+    dw_weight/expand/contract stay tied -- CORnet-S, Liao & Poggio, and IamNN
+    all independently report shared normalization hurting weight-tied
+    training. GroupNorm has no running stats (unlike the BatchNorm those
+    papers used), so only the shared-affine-parameter part of that finding
+    actually transfers here -- this is a cheap ablation, not a strongly
+    evidenced fix.
     """
-    def __init__(self, channels: int, expansion: int = 4, layer_scale: float = 1e-3):
+    def __init__(self, channels: int, expansion: int = 4, layer_scale: float = 1e-3,
+                 num_iterations: int = 1, untied_norm: bool = False):
         super().__init__()
         hidden = channels * expansion
+        self.untied_norm = untied_norm
 
         # 1x1 pointwise expansion
         self.expand = nn.Conv2d(channels, hidden, 1, bias=False)
-        self.gn1 = nn.GroupNorm(gn_groups(hidden), hidden)
         self.act = nn.SiLU(inplace=True)
 
         # 3x3 depthwise conv (dilation set at runtime)
@@ -102,16 +112,24 @@ class ECBlock(nn.Module):
 
         # 1x1 pointwise contraction
         self.contract = nn.Conv2d(hidden, channels, 1, bias=False)
-        self.gn2 = nn.GroupNorm(gn_groups(channels), channels)
+
+        if untied_norm:
+            self.gn1 = nn.ModuleList(nn.GroupNorm(gn_groups(hidden), hidden) for _ in range(num_iterations))
+            self.gn2 = nn.ModuleList(nn.GroupNorm(gn_groups(channels), channels) for _ in range(num_iterations))
+        else:
+            self.gn1 = nn.GroupNorm(gn_groups(hidden), hidden)
+            self.gn2 = nn.GroupNorm(gn_groups(channels), channels)
 
         # Learnable residual scaling (starts small for stable training)
         self.gamma = nn.Parameter(torch.ones(1) * layer_scale)
 
-    def forward(self, x: torch.Tensor, dilation: int = 1) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, dilation: int = 1, t: int = 0) -> torch.Tensor:
         identity = x
+        gn1 = self.gn1[t] if self.untied_norm else self.gn1
+        gn2 = self.gn2[t] if self.untied_norm else self.gn2
 
         # Expand channels
-        out = self.act(self.gn1(self.expand(x)))
+        out = self.act(gn1(self.expand(x)))
 
         # Depthwise conv with runtime dilation (key for weight reuse!)
         out = F.conv2d(out, self.dw_weight, self.dw_bias,
@@ -119,7 +137,7 @@ class ECBlock(nn.Module):
         out = self.divnorm(out)
 
         # Contract back to original channels
-        out = self.gn2(self.contract(out))
+        out = gn2(self.contract(out))
 
         # Residual connection with learned scaling
         return identity + self.gamma * out
@@ -153,6 +171,8 @@ class ECTiedNet(nn.Module):
         dilations: list[int] | None = None,
         stem: str = "cifar",
         max_gn_groups: int = 16,
+        num_transitions: int = 1,
+        untied_norm: bool = False,
     ):
         super().__init__()
         self.num_iterations = num_iterations
@@ -179,10 +199,30 @@ class ECTiedNet(nn.Module):
             self.stem_pool = None
 
         # THE weight-tied block (reused num_iterations times)
-        self.block = ECBlock(channels, expansion=expansion)
+        self.block = ECBlock(channels, expansion=expansion,
+                              num_iterations=num_iterations, untied_norm=untied_norm)
 
-        # Downsample midway through iterations
+        # ONE stateless BlurPool, reused at every transition point below (it
+        # has no learnable parameters, so reuse is exact -- no ModuleList
+        # needed and no risk of the classic "container keyed wrong" bug).
         self.blur = BlurPool2d(channels, stride=2)
+
+        # Transition points: 0-indexed iteration `t` after which to downsample.
+        # `num_transitions` evenly-spaced points via round(k*N/(T+1))-1 for
+        # k in 1..T (Liao & Poggio's fully-shared multi-state design uses
+        # exactly this periodic-parameter-free-transition pattern). Points
+        # that fall outside [0, num_iterations-1] are dropped rather than
+        # clamped -- this is what makes num_transitions=1 reproduce the old
+        # single-hardcoded-midpoint behavior exactly (including "no downsample
+        # at all" for num_iterations=1), and what makes shallow depths degrade
+        # gracefully to fewer effective transitions instead of downsampling
+        # after every single iteration or clamping multiple requested points
+        # onto the same boundary iteration.
+        self.transition_points = {
+            round(k * num_iterations / (num_transitions + 1)) - 1
+            for k in range(1, num_transitions + 1)
+        }
+        self.transition_points = {t for t in self.transition_points if 0 <= t < num_iterations}
 
         # Classification head
         self.head = nn.Linear(channels, num_classes)
@@ -216,11 +256,11 @@ class ECTiedNet(nn.Module):
         features = {} if self.return_nodes else None
 
         for t in range(self.num_iterations):
-            # Reuse same block with different dilation
-            x = self.block(x, dilation=self.dilations[t])
+            # Reuse same block with different dilation (and, if untied_norm,
+            # its own per-iteration GroupNorm affine params via t)
+            x = self.block(x, dilation=self.dilations[t], t=t)
 
-            # Downsample halfway through
-            if t == (self.num_iterations // 2) - 1:
+            if t in self.transition_points:
                 x = self.blur(x)
 
             if features is not None:
