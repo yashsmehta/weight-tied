@@ -1,0 +1,35 @@
+{
+  "mode": "train",
+  "seed": 1,
+  "dataset": "imagenet-mini-50",
+  "batchsize": 64,
+  "num_workers": 8,
+  "data_augment": true,
+  "train_fraction": 1.0,
+
+  "model_name": "ECTiedNet",
+  "pretrained_dataset": "none",
+  "arch": {
+    "channels": 64,
+    "num_iterations": 4,
+    "expansion": 8,
+    "max_gn_groups": 16,
+    "num_transitions": 3,
+    "untied_norm": true
+  },
+
+  "optimizer": "adamw",
+  "learning_rate": 1e-3,
+  "weight_decay": 0.01,
+  "grad_clip": 1.0,
+  "lr_scheduler": "cosineannealinglr",
+  "num_epochs": 60,
+  "warmup_epochs": 3,
+
+  "log_interval": 1,
+  "log_checkpoints": true,
+  "checkpoint_interval": 10,
+  "checkpoint_dir": "ectiednet_imagenet50_depth4_transitions3_untiednorm_expansion8",
+
+  "use_wandb": false
+}
