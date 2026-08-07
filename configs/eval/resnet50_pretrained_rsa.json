@@ -18,8 +18,11 @@
   "num_workers": 8,
 
   "load_model_from": "torchvision",
-  "model_name": "ResNet50",
-  "pretrained_dataset": "imagenet1k",
+  "torchvision": {
+    "model_name": "ResNet50",
+    "pretrained_dataset": "imagenet1k",
+    "return_nodes": ["conv1", "block1", "block3", "block5", "block7", "block9", "block11", "block13", "block15", "block16"]
+  },
 
   "log_expdata": true
 }

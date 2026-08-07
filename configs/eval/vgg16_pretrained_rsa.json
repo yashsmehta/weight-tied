@@ -18,8 +18,11 @@
   "num_workers": 8,
 
   "load_model_from": "torchvision",
-  "model_name": "VGG16",
-  "pretrained_dataset": "imagenet1k",
+  "torchvision": {
+    "model_name": "VGG16",
+    "pretrained_dataset": "imagenet1k",
+    "return_nodes": ["conv2", "conv4", "conv7", "conv10", "conv13", "fc1", "fc2"]
+  },
 
   "log_expdata": true
 }

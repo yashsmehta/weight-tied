@@ -18,8 +18,11 @@
   "num_workers": 8,
 
   "load_model_from": "torchvision",
-  "model_name": "AlexNet",
-  "pretrained_dataset": "imagenet1k",
+  "torchvision": {
+    "model_name": "AlexNet",
+    "pretrained_dataset": "imagenet1k",
+    "return_nodes": ["conv1", "conv2", "conv3", "conv4", "conv5", "fc1", "fc2"]
+  },
 
   "log_expdata": true
 }
