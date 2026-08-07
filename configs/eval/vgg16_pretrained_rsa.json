@@ -1,0 +1,25 @@
+{
+  "_comment": "Pretrained-baseline sanity check: re-run through the new weight-tied eval pipeline (previously run through visreps) to confirm the numbers still line up.",
+
+  "mode": "eval",
+  "seed": 1,
+
+  "neural_dataset": "nsd",
+  "region": ["early visual stream", "ventral visual stream"],
+  "subject_idx": [0, 1, 2, 3, 4, 5, 6, 7],
+
+  "analysis": "rsa",
+  "compare_method": "spearman",
+  "bootstrap": false,
+  "n_bootstrap": 1000,
+  "n_select": 1000,
+
+  "batchsize": 256,
+  "num_workers": 8,
+
+  "load_model_from": "torchvision",
+  "model_name": "VGG16",
+  "pretrained_dataset": "imagenet1k",
+
+  "log_expdata": true
+}

@@ -22,9 +22,13 @@ from analysis.sparse_random_projection import get_srp_transformer
 from model import ECTiedNet
 from utils import console, get_seed_letter, rprint
 
-# Default extraction points for pretrained torchvision models.
+# Default extraction points for pretrained torchvision models. Verbatim from
+# visreps/models/utils.py's TORCHVISION_RETURN_NODES, for the models this
+# project actually compares against.
 TORCHVISION_RETURN_NODES = {
-    "AlexNet": ["conv1", "conv2", "conv3", "conv4", "conv5", "fc1", "fc2"],
+    "AlexNet":  ["conv1", "conv2", "conv3", "conv4", "conv5", "fc1", "fc2"],
+    "VGG16":    ["conv2", "conv4", "conv7", "conv10", "conv13", "fc1", "fc2"],
+    "ResNet50": ["conv1"] + [f"block{i}" for i in range(1, 17, 2)] + ["block16"],
 }
 
 
@@ -339,13 +343,13 @@ def extract_single_layer(
 
 
 def load_model(cfg, device, num_classes=None, verbose=False):
-    """Load a model from checkpoint, or build a fresh ECTiedNet/AlexNet.
+    """Load a model from checkpoint, or build a fresh ECTiedNet/AlexNet/VGG16/ResNet50.
 
     cfg keys used:
       - eval, from checkpoint: load_model_from="checkpoint", seed, cfg_id,
         checkpoint_dir, checkpoint_model
-      - train, or eval from torchvision: model_name ("ECTiedNet"/"AlexNet"),
-        pretrained_dataset, arch (ECTiedNet only)
+      - train, or eval from torchvision: model_name ("ECTiedNet"/"AlexNet"/
+        "VGG16"/"ResNet50"), pretrained_dataset, arch (ECTiedNet only)
     """
     if getattr(cfg, "load_model_from", None) == "checkpoint":
         if num_classes is not None:
@@ -380,6 +384,29 @@ def load_model(cfg, device, num_classes=None, verbose=False):
             model.classifier[-1] = torch.nn.Linear(4096, num_classes)
             torch.nn.init.xavier_uniform_(model.classifier[-1].weight)
             torch.nn.init.zeros_(model.classifier[-1].bias)
+    elif model_name == "VGG16":
+        if pretrained_dataset == "imagenet1k":
+            model = torchvision.models.vgg16(weights=torchvision.models.VGG16_Weights.IMAGENET1K_V1)
+        elif pretrained_dataset == "none":
+            model = torchvision.models.vgg16(weights=None)
+        else:
+            raise ValueError(f"Invalid pretrained_dataset: {pretrained_dataset}")
+        if num_classes is not None and num_classes != 1000:
+            model.classifier[-1] = torch.nn.Linear(4096, num_classes)
+            torch.nn.init.xavier_uniform_(model.classifier[-1].weight)
+            torch.nn.init.zeros_(model.classifier[-1].bias)
+    elif model_name == "ResNet50":
+        if pretrained_dataset == "imagenet1k":
+            # Matches visreps's standard_model.ResNet50 exactly (V2, not V1).
+            model = torchvision.models.resnet50(weights=torchvision.models.ResNet50_Weights.IMAGENET1K_V2)
+        elif pretrained_dataset == "none":
+            model = torchvision.models.resnet50(weights=None)
+        else:
+            raise ValueError(f"Invalid pretrained_dataset: {pretrained_dataset}")
+        if num_classes is not None and num_classes != 1000:
+            model.fc = torch.nn.Linear(2048, num_classes)
+            torch.nn.init.xavier_uniform_(model.fc.weight)
+            torch.nn.init.zeros_(model.fc.bias)
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
 
