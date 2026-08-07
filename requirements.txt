@@ -15,3 +15,8 @@ python-dotenv
 wandb
 scikit-learn
 tqdm
+
+# CORnet-S baseline (eval only). NOT the PyPI "cornet" package (an unrelated
+# database-connector library that happens to share the name) -- must come
+# from the actual dicarlolab repo.
+git+https://github.com/dicarlolab/CORnet.git

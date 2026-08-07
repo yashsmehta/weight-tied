@@ -1,9 +1,10 @@
 """Model loading, checkpointing, and activation extraction.
 
-Ported from visreps/models/utils.py, trimmed to the two models this project
-uses (ECTiedNet, AlexNet) -- drops CustomCNN/TinyCustomCNN and the
-custom_model config path entirely. Checkpoint provenance (git SHA capture)
-folded in from visreps/git_sha_capture.patch.
+Ported from visreps/models/utils.py, trimmed to the models this project
+uses (ECTiedNet, AlexNet, VGG16, ResNet50, CORnet_S) -- drops
+CustomCNN/TinyCustomCNN and the custom_model config path entirely.
+Checkpoint provenance (git SHA capture) folded in from
+visreps/git_sha_capture.patch.
 """
 import json
 import os
@@ -11,6 +12,7 @@ import subprocess
 from collections import defaultdict
 from typing import Dict, List, Tuple
 
+import cornet
 import numpy as np
 import torch
 import torch.nn as nn
@@ -24,11 +26,14 @@ from utils import console, get_seed_letter, rprint
 
 # Default extraction points for pretrained torchvision models. Verbatim from
 # visreps/models/utils.py's TORCHVISION_RETURN_NODES, for the models this
-# project actually compares against.
+# project actually compares against. CORnet_S's "embedding" is decoder.avgpool
+# (pooled, pre-classifier) -- the closest analog to the other models' fc2/
+# final-embedding extraction point.
 TORCHVISION_RETURN_NODES = {
     "AlexNet":  ["conv1", "conv2", "conv3", "conv4", "conv5", "fc1", "fc2"],
     "VGG16":    ["conv2", "conv4", "conv7", "conv10", "conv13", "fc1", "fc2"],
     "ResNet50": ["conv1"] + [f"block{i}" for i in range(1, 17, 2)] + ["block16"],
+    "CORnet_S": ["V1", "V2", "V4", "IT", "embedding"],
 }
 
 
@@ -120,6 +125,23 @@ class FeatureExtractor(nn.Module):
                     mapping[f"fc{fc_count}"] = f"classifier.{name}"
                     fc_count += 1
                     seen_modules.add(id(module))
+
+        elif hasattr(self.model, "V1") and hasattr(self.model, "IT"):
+            # CORnet-S: named areas V1/V2/V4/IT, each area's own forward()
+            # runs its internal recurrence loop (V2 x2, V4 x4, IT x2) and
+            # exposes only the FINAL timestep via a trailing Identity()
+            # submodule -- unlike ECTiedNet's weight-tied block, the loop
+            # lives entirely inside each area's own forward(), so a plain
+            # hook on that Identity is the correct (and standard, per
+            # Brain-Score convention) one-feature-per-area extraction point.
+            for area in ("V1", "V2", "V4", "IT"):
+                area_module = getattr(self.model, area, None)
+                if area_module is not None and hasattr(area_module, "output"):
+                    mapping[area] = f"{area}.output"
+                    seen_modules.add(id(area_module.output))
+            if hasattr(self.model, "decoder") and hasattr(self.model.decoder, "avgpool"):
+                mapping["embedding"] = "decoder.avgpool"
+                seen_modules.add(id(self.model.decoder.avgpool))
 
         if not mapping:
             for name, module in self.model.named_modules():
@@ -343,13 +365,13 @@ def extract_single_layer(
 
 
 def load_model(cfg, device, num_classes=None, verbose=False):
-    """Load a model from checkpoint, or build a fresh ECTiedNet/AlexNet/VGG16/ResNet50.
+    """Load a model from checkpoint, or build a fresh ECTiedNet/AlexNet/VGG16/ResNet50/CORnet_S.
 
     cfg keys used:
       - eval, from checkpoint: load_model_from="checkpoint", seed, cfg_id,
         checkpoint_dir, checkpoint_model
       - train, or eval from torchvision: model_name ("ECTiedNet"/"AlexNet"/
-        "VGG16"/"ResNet50"), pretrained_dataset, arch (ECTiedNet only)
+        "VGG16"/"ResNet50"/"CORnet_S"), pretrained_dataset, arch (ECTiedNet only)
     """
     if getattr(cfg, "load_model_from", None) == "checkpoint":
         if num_classes is not None:
@@ -407,6 +429,20 @@ def load_model(cfg, device, num_classes=None, verbose=False):
             model.fc = torch.nn.Linear(2048, num_classes)
             torch.nn.init.xavier_uniform_(model.fc.weight)
             torch.nn.init.zeros_(model.fc.bias)
+    elif model_name == "CORnet_S":
+        # Eval-only baseline, matches this project's other pretrained
+        # comparisons -- no num_classes head-swap support (cornet's own
+        # get_model() has none either). cornet.cornet_s() always returns a
+        # DataParallel-wrapped model (needed to load the authors' checkpoint,
+        # whose state_dict keys are "module."-prefixed); unwrap via .module
+        # to get the plain nn.Sequential(V1, V2, V4, IT, decoder) that
+        # FeatureExtractor's CORnet branch expects.
+        if pretrained_dataset == "imagenet1k":
+            model = cornet.cornet_s(pretrained=True, map_location=device).module
+        elif pretrained_dataset == "none":
+            model = cornet.cornet_s(pretrained=False).module
+        else:
+            raise ValueError(f"Invalid pretrained_dataset: {pretrained_dataset}")
     else:
         raise ValueError(f"Unknown model_name: {model_name}")
 

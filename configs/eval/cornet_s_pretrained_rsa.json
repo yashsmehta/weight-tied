@@ -1,0 +1,28 @@
+{
+  "_comment": "Pretrained CORnet-S baseline (Kubilius et al. 2019). Not previously run through visreps -- this is a new comparison point, not a re-verification.",
+
+  "mode": "eval",
+  "seed": 1,
+
+  "neural_dataset": "nsd",
+  "region": ["early visual stream", "ventral visual stream"],
+  "subject_idx": [0, 1, 2, 3, 4, 5, 6, 7],
+
+  "analysis": "rsa",
+  "compare_method": "spearman",
+  "bootstrap": false,
+  "n_bootstrap": 1000,
+  "n_select": 1000,
+
+  "batchsize": 256,
+  "num_workers": 8,
+
+  "load_model_from": "torchvision",
+  "torchvision": {
+    "model_name": "CORnet_S",
+    "pretrained_dataset": "imagenet1k",
+    "return_nodes": ["V1", "V2", "V4", "IT", "embedding"]
+  },
+
+  "log_expdata": true
+}
