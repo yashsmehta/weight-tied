@@ -53,6 +53,13 @@ def _build_header(cfg):
     return " | ".join(parts)
 
 
+def _print_cross_region_summary(region_means):
+    """Print a final summary line (mean score) for each evaluated region."""
+    rprint(f"\n  {'=' * 46}", style="highlight")
+    for region, mean in region_means.items():
+        rprint(f"  {region:<30} {mean:.4f}", style="highlight")
+
+
 def _listify(val):
     """Ensure val is a plain Python list (handles int, str, ListConfig, list)."""
     if isinstance(val, (list, ListConfig)):
@@ -205,8 +212,10 @@ def _eval_rsa(cfg, model, acts, ids, all_data, subjects, regions, dev, verbose):
 
     # ── Per-(region, subject) scoring + save ──
     all_results = []
+    region_means = {}
     for region in regions:
         rprint(f"\n  -- Region: {region} --", style="info")
+        region_scores = []
 
         for subj in subjects:
             best_layer = per_region_layers[region][subj]
@@ -262,7 +271,14 @@ def _eval_rsa(cfg, model, acts, ids, all_data, subjects, regions, dev, verbose):
                 save_results(results_df, save_cfg)
 
             all_results.append(result)
+            region_scores.append(point_estimate)
 
+        mean, std = np.mean(region_scores), np.std(region_scores)
+        rprint(f"    {'-' * 34}", style="info")
+        rprint(f"    Mean{' ' * 5}{mean:.4f} +/- {std:.4f}", style="highlight")
+        region_means[region] = mean
+
+    _print_cross_region_summary(region_means)
     return pd.DataFrame(all_results)
 
 
@@ -272,8 +288,10 @@ def _eval_encoding(cfg, model, acts, ids, all_data, subjects, regions, verbose):
     neural = all_data["neural"]
 
     all_results = []
+    region_means = {}
     for region in regions:
         rprint(f"\n  -- Region: {region} --", style="info")
+        region_scores = []
 
         for subj in subjects:
             subj_neural = neural[region][subj]
@@ -292,6 +310,17 @@ def _eval_encoding(cfg, model, acts, ids, all_data, subjects, regions, verbose):
                 save_results(results_df, save_cfg)
 
             all_results.extend(alignment_scores)
+            for res in alignment_scores:
+                method_label = str(res.get("compare_method", "pearson")).capitalize()
+                rprint(f"    subj {subj} | {method_label:<10}| {res['layer']} = {res['score']:.4f}", style="highlight")
+                region_scores.append(res["score"])
+
+        mean, std = np.mean(region_scores), np.std(region_scores)
+        rprint(f"    {'-' * 34}", style="info")
+        rprint(f"    Mean{' ' * 5}{mean:.4f} +/- {std:.4f}", style="highlight")
+        region_means[region] = mean
+
+    _print_cross_region_summary(region_means)
 
     del acts, model
     torch.cuda.empty_cache()
