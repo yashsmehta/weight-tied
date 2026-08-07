@@ -222,8 +222,19 @@ def configure_feature_extractor(cfg, model, verbose=False):
     if not return_nodes:
         raise ValueError("return_nodes must be specified in config")
     return_nodes = {node: node for node in return_nodes} if isinstance(return_nodes, list) else return_nodes
-    extract_pre_and_post = cfg.get("extract_pre_and_post", True)
     model.eval()
+
+    if isinstance(model, ECTiedNet):
+        # Weight-tied block is reused num_iterations times; a forward hook
+        # would only ever capture the LAST call. Use the model's own
+        # dict-returning forward() mode instead (set via return_nodes).
+        model.return_nodes = return_nodes
+        rprint(f"  {len(return_nodes)} extraction points (self-reporting)", style="success")
+        if verbose:
+            rprint(f"    Points: {list(return_nodes.keys())}", style="info")
+        return model
+
+    extract_pre_and_post = cfg.get("extract_pre_and_post", True)
     extractor = FeatureExtractor(model, return_nodes, extract_pre_and_post=extract_pre_and_post)
     n_points = len(extractor.return_nodes)
     n_layers = len(return_nodes)
