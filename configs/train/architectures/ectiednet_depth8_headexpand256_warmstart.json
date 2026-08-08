@@ -1,0 +1,47 @@
+{
+  "_comment_warm_start_dir": "warm_start.checkpoint_dir uses the FULL path (model_checkpoints/... prefix included, matching eval's checkpoint.checkpoint_dir convention verbatim) -- this project's own train-mode checkpoint_dir does NOT include that prefix (setup_checkpoint_dir() adds it automatically). Do not confuse the two.",
+  "_comment_source": "Source checkpoint is the depth=8 3-way-combo run (num_transitions=3, untied_norm, expansion=8), 45.00%/69.33% top-1/top-5 at epoch 50 on real ImageNet-1K. That checkpoint is never written to by this config -- see config.py's warm_start validation.",
+
+  "mode": "train",
+  "seed": 1,
+  "dataset": "imagenet",
+  "batchsize": 64,
+  "num_workers": 8,
+  "data_augment": true,
+  "train_fraction": 1.0,
+
+  "model_name": "ECTiedNet",
+  "pretrained_dataset": "none",
+  "arch": {
+    "channels": 64,
+    "num_iterations": 8,
+    "expansion": 8,
+    "max_gn_groups": 16,
+    "num_transitions": 3,
+    "untied_norm": true,
+    "head_expand_dim": 256
+  },
+
+  "warm_start": {
+    "checkpoint_dir": "model_checkpoints/ectiednet_imagenet1k_depth8_transitions3_untiednorm_expansion8_50ep",
+    "cfg_id": 1000,
+    "checkpoint_model": "checkpoint_epoch_50.pth",
+    "seed": 1,
+    "freeze_backbone": true
+  },
+
+  "optimizer": "adamw",
+  "learning_rate": 1e-3,
+  "weight_decay": 0.01,
+  "grad_clip": 1.0,
+  "lr_scheduler": "cosineannealinglr",
+  "num_epochs": 10,
+  "warmup_epochs": 1,
+
+  "log_interval": 1,
+  "log_checkpoints": true,
+  "checkpoint_interval": 2,
+  "checkpoint_dir": "ectiednet_imagenet1k_depth8_headexpand256_warmstart",
+
+  "use_wandb": false
+}

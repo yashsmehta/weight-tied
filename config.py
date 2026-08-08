@@ -85,6 +85,25 @@ def _validate_train(cfg):
     if not hasattr(cfg, "batchsize"):
         cfg.batchsize = 64
         rprint("Using default batch size: 64", style="info")
+
+    warm_start = cfg.get("warm_start", None)
+    if warm_start:
+        # This run only ever reads the source checkpoint (model_utils.
+        # _warm_start_ectiednet: torch.load + .state_dict(), never a write) --
+        # but a same-directory typo would still mean this run's OWN
+        # checkpoint saves land in the same folder as the warm-start source,
+        # so guard against that explicitly rather than relying on "reads
+        # only" alone.
+        if warm_start.get("checkpoint_dir") == cfg.get("checkpoint_dir"):
+            raise AssertionError(
+                "warm_start.checkpoint_dir must differ from checkpoint_dir -- "
+                "this run must not save checkpoints into the directory it's warm-starting from"
+            )
+        seed_letter = get_seed_letter(warm_start.seed)
+        src_path = Path(f"{warm_start.checkpoint_dir}/cfg{warm_start.cfg_id}{seed_letter}/{warm_start.checkpoint_model}")
+        if not src_path.exists():
+            raise AssertionError(f"warm_start checkpoint not found: {src_path}")
+
     if cfg.get("verbose", False):
         rprint("Config validated", style="success")
     return cfg

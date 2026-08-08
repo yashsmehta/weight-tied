@@ -1,0 +1,30 @@
+{
+  "_comment_checkpoint_model": "Confirm final checkpoint filename before running -- checkpoint_interval=2 over 10 epochs in the warm-start training config, so this should be checkpoint_epoch_10.pth if training completes all 10 epochs.",
+  "_comment_embedding": "\"embedding\" here is the NEW 256-dim head_expand+GAP output, not the old 64-dim one -- not directly comparable in raw dimensionality to other models' embeddings, only in downstream RSA/encoding score.",
+
+  "mode": "eval",
+  "seed": 1,
+
+  "neural_dataset": "nsd",
+  "region": ["early visual stream", "ventral visual stream"],
+  "subject_idx": [0, 1, 2, 3, 4, 5, 6, 7],
+
+  "analysis": "encoding_score",
+  "compare_method": "spearman",
+  "bootstrap": false,
+  "n_bootstrap": 1000,
+  "n_select": 1000,
+
+  "batchsize": 256,
+  "num_workers": 8,
+
+  "load_model_from": "checkpoint",
+  "checkpoint": {
+    "checkpoint_dir": "model_checkpoints/ectiednet_imagenet1k_depth8_headexpand256_warmstart",
+    "cfg_id": 1000,
+    "checkpoint_model": "checkpoint_epoch_10.pth",
+    "return_nodes": ["iter1", "iter2", "iter3", "iter4", "iter5", "iter6", "iter7", "iter8", "embedding"]
+  },
+
+  "log_expdata": true
+}

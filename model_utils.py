@@ -364,6 +364,71 @@ def extract_single_layer(
     return acts, all_ids
 
 
+def _warm_start_ectiednet(model, warm_start_cfg, device, verbose=False):
+    """Load backbone weights from an existing training checkpoint into a
+    freshly constructed ECTiedNet (e.g. one with a new head_expand the old
+    checkpoint doesn't have), freezing every param that loaded successfully.
+    New/mismatched params (head_expand, and the classifier when
+    head_expand_dim changes its input width) are left at their fresh random
+    init and stay trainable.
+
+    This only ever READS the source checkpoint (torch.load + .state_dict())
+    -- it never writes to it. Whatever checkpoint_dir the *current* training
+    run saves to is a config.py-enforced separate directory (see
+    _validate_train's warm_start check), so the source checkpoint this
+    warm-starts from is never at risk of being overwritten.
+
+    warm_start_cfg keys: checkpoint_dir (full path, e.g.
+    "model_checkpoints/ectiednet_imagenet1k_depth8..." -- same verbatim-path
+    convention as eval's checkpoint.checkpoint_dir, NOT auto-prefixed the
+    way training's own checkpoint_dir is), cfg_id, checkpoint_model, seed,
+    freeze_backbone (default True).
+    """
+    seed_letter = get_seed_letter(warm_start_cfg.seed)
+    checkpoint_path = f"{warm_start_cfg.checkpoint_dir}/cfg{warm_start_cfg.cfg_id}{seed_letter}/{warm_start_cfg.checkpoint_model}"
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    source_state = checkpoint["model"].state_dict()
+
+    target_state = model.state_dict()
+    loaded_keys = set()
+    for key, tensor in source_state.items():
+        # "head." is always excluded, not just shape-mismatched: this warm-
+        # start mode exists specifically to train a fresh classifier on top
+        # of a frozen backbone, so head.weight/head.bias must never be
+        # reused. Without this, head.bias ([num_classes], independent of
+        # head_expand_dim) would coincidentally shape-match the source and
+        # get silently loaded+frozen while head.weight trains from scratch
+        # next to it -- a frozen bias paired with a from-scratch weight. And
+        # if head_expand_dim ever equals channels, head.weight would ALSO
+        # accidentally shape-match, silently freezing the entire classifier.
+        if key.startswith("head."):
+            continue
+        # Shape check for everything else: load_state_dict would otherwise
+        # raise on a same-named-but-differently-shaped tensor rather than
+        # skipping it.
+        if key in target_state and target_state[key].shape == tensor.shape:
+            target_state[key] = tensor
+            loaded_keys.add(key)
+    model.load_state_dict(target_state)
+
+    freeze_backbone = warm_start_cfg.get("freeze_backbone", True)
+    if freeze_backbone:
+        for name, param in model.named_parameters():
+            if name in loaded_keys:
+                param.requires_grad = False
+
+    trainable = sorted(n for n, p in model.named_parameters() if p.requires_grad)
+    rprint(
+        f"  Warm-started {len(loaded_keys)}/{len(target_state)} params from {checkpoint_path}"
+        f"{' (backbone frozen)' if freeze_backbone else ' (backbone NOT frozen)'}",
+        style="success",
+    )
+    if verbose:
+        rprint(f"    Trainable: {trainable}", style="info")
+
+    return model.to(device)
+
+
 def load_model(cfg, device, num_classes=None, verbose=False):
     """Load a model from checkpoint, or build a fresh ECTiedNet/AlexNet/VGG16/ResNet50/CORnet_S.
 
@@ -395,6 +460,10 @@ def load_model(cfg, device, num_classes=None, verbose=False):
         arch_cfg = getattr(cfg, "arch", {})
         arch_kwargs = OmegaConf.to_container(arch_cfg, resolve=True) if arch_cfg else {}
         model = ECTiedNet(num_classes=num_classes, stem="imagenet", **arch_kwargs)
+
+        warm_start_cfg = getattr(cfg, "warm_start", None)
+        if warm_start_cfg:
+            model = _warm_start_ectiednet(model, warm_start_cfg, device, verbose=verbose)
     elif model_name == "AlexNet":
         if pretrained_dataset == "imagenet1k":
             model = torchvision.models.alexnet(weights=torchvision.models.AlexNet_Weights.IMAGENET1K_V1)

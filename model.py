@@ -173,6 +173,7 @@ class ECTiedNet(nn.Module):
         max_gn_groups: int = 16,
         num_transitions: int = 1,
         untied_norm: bool = False,
+        head_expand_dim: int | None = None,
     ):
         super().__init__()
         self.num_iterations = num_iterations
@@ -224,8 +225,25 @@ class ECTiedNet(nn.Module):
         }
         self.transition_points = {t for t in self.transition_points if 0 <= t < num_iterations}
 
+        # Optional nonlinear readout head: 1x1 conv (channels -> head_expand_dim)
+        # + activation, applied to the final iteration's feature map before GAP.
+        # Meant for warm-starting from a frozen pretrained backbone (see
+        # model_utils._warm_start_ectiednet) to test whether readout capacity/
+        # dimensionality alone -- isolated from the tied-backbone question --
+        # affects brain-alignment fit. Absent (None) reproduces the old
+        # channels-wide GAP exactly.
+        if head_expand_dim is not None:
+            self.head_expand = nn.Sequential(
+                nn.Conv2d(channels, head_expand_dim, 1, bias=False),
+                nn.SiLU(inplace=True),
+            )
+            head_in = head_expand_dim
+        else:
+            self.head_expand = None
+            head_in = channels
+
         # Classification head
-        self.head = nn.Linear(channels, num_classes)
+        self.head = nn.Linear(head_in, num_classes)
 
         # Dilation schedule for multi-scale processing. Cycles [1,1,2] pre-
         # downsample / [1,2,3] post-downsample indefinitely so any depth
@@ -268,7 +286,15 @@ class ECTiedNet(nn.Module):
                 if key in self.return_nodes:
                     features[self.return_nodes[key]] = x
 
-        pooled = x.mean(dim=(2, 3))  # Global average pooling -> [B, C]
+        # getattr guard, not self.head_expand: old checkpoints pickled before
+        # this attribute existed won't have it in their restored __dict__,
+        # and would otherwise AttributeError under the current class's
+        # forward() (pickle restores instance state, not __init__ defaults).
+        head_expand = getattr(self, "head_expand", None)
+        if head_expand is not None:
+            x = head_expand(x)
+
+        pooled = x.mean(dim=(2, 3))  # Global average pooling -> [B, C] (or head_expand_dim, if set)
 
         if features is not None:
             if "embedding" in self.return_nodes:
