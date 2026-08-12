@@ -5,6 +5,8 @@ Key idea: Instead of having separate weights per layer, we reuse ONE block
 multiple times with different dilation rates. This reduces parameters while
 capturing multi-scale features through varying receptive fields.
 """
+from collections import Counter
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -212,18 +214,21 @@ class ECTiedNet(nn.Module):
         # `num_transitions` evenly-spaced points via round(k*N/(T+1))-1 for
         # k in 1..T (Liao & Poggio's fully-shared multi-state design uses
         # exactly this periodic-parameter-free-transition pattern). Points
-        # that fall outside [0, num_iterations-1] are dropped rather than
-        # clamped -- this is what makes num_transitions=1 reproduce the old
-        # single-hardcoded-midpoint behavior exactly (including "no downsample
-        # at all" for num_iterations=1), and what makes shallow depths degrade
-        # gracefully to fewer effective transitions instead of downsampling
-        # after every single iteration or clamping multiple requested points
-        # onto the same boundary iteration.
-        self.transition_points = {
-            round(k * num_iterations / (num_transitions + 1)) - 1
+        # are CLAMPED into [0, num_iterations-1] and counted with multiplicity
+        # (via Counter) rather than deduplicated into a set -- this keeps the
+        # total number of downsamples equal to num_transitions regardless of
+        # depth, so shallow nets (e.g. num_iterations=1) stack every requested
+        # transition onto their one available boundary instead of silently
+        # losing them. This makes final spatial resolution -- and therefore
+        # receptive field size reaching the GAP/readout -- match across depths
+        # for the same num_transitions, which matters for comparing RSA/
+        # encoding scores across depths without resolution as a confound.
+        # For num_iterations >= num_transitions (no clamping needed), this is
+        # identical to the old set-based behavior.
+        self.transition_counts = Counter(
+            max(0, min(num_iterations - 1, round(k * num_iterations / (num_transitions + 1)) - 1))
             for k in range(1, num_transitions + 1)
-        }
-        self.transition_points = {t for t in self.transition_points if 0 <= t < num_iterations}
+        )
 
         # Optional nonlinear readout head: 1x1 conv (channels -> head_expand_dim)
         # + activation, applied to the final iteration's feature map before GAP.
@@ -278,7 +283,7 @@ class ECTiedNet(nn.Module):
             # its own per-iteration GroupNorm affine params via t)
             x = self.block(x, dilation=self.dilations[t], t=t)
 
-            if t in self.transition_points:
+            for _ in range(self.transition_counts.get(t, 0)):
                 x = self.blur(x)
 
             if features is not None:
