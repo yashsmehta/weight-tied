@@ -276,6 +276,15 @@ class ECTiedNet(nn.Module):
         if self.stem_pool is not None:
             x = self.stem_pool(x)  # [B, C, 56, 56]
 
+        # getattr guard, not self.transition_counts: checkpoints pickled
+        # before this attribute replaced the old set-based transition_points
+        # (torch.save on the whole nn.Module) restore __dict__ as it was at
+        # save time, skipping __init__ -- so old checkpoints only have
+        # transition_points. Migrate on the fly (each old point had count 1).
+        transition_counts = getattr(self, "transition_counts", None)
+        if transition_counts is None:
+            transition_counts = Counter({t: 1 for t in self.transition_points})
+
         features = {} if self.return_nodes else None
 
         for t in range(self.num_iterations):
@@ -283,7 +292,7 @@ class ECTiedNet(nn.Module):
             # its own per-iteration GroupNorm affine params via t)
             x = self.block(x, dilation=self.dilations[t], t=t)
 
-            for _ in range(self.transition_counts.get(t, 0)):
+            for _ in range(transition_counts.get(t, 0)):
                 x = self.blur(x)
 
             if features is not None:
