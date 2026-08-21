@@ -22,6 +22,15 @@ _CHECKPOINT_DIRS = {
     "depth1": "model_checkpoints/ectiednet_imagenet1k_depth1_transitions1_untiednorm_expansion8_50ep",
     "depth8": "model_checkpoints/ectiednet_imagenet1k_depth8_transitions1_untiednorm_expansion8_50ep",
 }
+# all four depths, used only by the depth-progression plot (epoch 50 only --
+# depth2/depth4 don't have the intermediate-epoch evals depth1/depth8 have)
+_ALL_CHECKPOINT_DIRS = {
+    "depth1": "model_checkpoints/ectiednet_imagenet1k_depth1_transitions1_untiednorm_expansion8_50ep",
+    "depth2": "model_checkpoints/ectiednet_imagenet1k_depth2_transitions1_untiednorm_expansion8_50ep",
+    "depth4": "model_checkpoints/ectiednet_imagenet1k_depth4_transitions1_untiednorm_expansion8_50ep",
+    "depth8": "model_checkpoints/ectiednet_imagenet1k_depth8_transitions1_untiednorm_expansion8_50ep",
+}
+_DEPTH_VALUES = {"depth1": 1, "depth2": 2, "depth4": 4, "depth8": 8}
 _EPOCHS = [5, 10, 25, 50]
 _ANALYSES = ["rsa", "encoding_score"]
 _ANALYSIS_LABELS = {"rsa": "RSA", "encoding_score": "Encoding"}
@@ -33,19 +42,19 @@ _REGION_COLORS = {"early visual stream": "#2a78d6", "ventral visual stream": "#e
 _DEPTH_COLORS = {"depth1": "#2a78d6", "depth8": "#eb6834"}
 
 
-def load_scores() -> pd.DataFrame:
+def load_scores(checkpoint_dirs: dict) -> pd.DataFrame:
     conn = sqlite3.connect(str(_RESULTS_DB_PATH))
-    placeholders = ",".join("?" * len(_CHECKPOINT_DIRS))
+    placeholders = ",".join("?" * len(checkpoint_dirs))
     df = pd.read_sql_query(
         f"SELECT checkpoint_dir, analysis, region, subject_idx, epoch, score "
         f"FROM results WHERE checkpoint_dir IN ({placeholders})",
-        conn, params=list(_CHECKPOINT_DIRS.values()),
+        conn, params=list(checkpoint_dirs.values()),
     )
     conn.close()
     if df.empty:
-        raise ValueError(f"No rows in {_RESULTS_DB_PATH} for the depth1/depth8 checkpoint dirs")
+        raise ValueError(f"No rows in {_RESULTS_DB_PATH} for {list(checkpoint_dirs.values())}")
 
-    dir_to_depth = {v: k for k, v in _CHECKPOINT_DIRS.items()}
+    dir_to_depth = {v: k for k, v in checkpoint_dirs.items()}
     df["depth"] = df["checkpoint_dir"].map(dir_to_depth)
 
     # mean across subjects -- matches the "Mean" line evals.py prints per (region, analysis, epoch)
@@ -132,11 +141,51 @@ def plot_epoch_comparison(df: pd.DataFrame, epoch: int, out_path: str):
     print(f"Saved {out_path}")
 
 
+def plot_depth_progression(df: pd.DataFrame, epoch: int, out_path: str):
+    """Line chart: score vs. depth (1/2/4/8) at a fixed epoch, one panel per
+    analysis, one line per region."""
+    sub = df[df["epoch"] == epoch]
+    missing = [d for d in _ALL_CHECKPOINT_DIRS if d not in sub["depth"].unique()]
+    if missing:
+        print(f"  [warn] epoch {epoch}: no data for {missing} -- run those evals first")
+
+    depths_sorted = sorted(_ALL_CHECKPOINT_DIRS, key=lambda d: _DEPTH_VALUES[d])
+    x_values = [_DEPTH_VALUES[d] for d in depths_sorted]
+
+    fig, axes = plt.subplots(1, len(_ANALYSES), figsize=(6 * len(_ANALYSES), 4.5))
+    for ax, analysis in zip(axes, _ANALYSES):
+        for region in _REGIONS:
+            line = sub[(sub["analysis"] == analysis) & (sub["region"] == region)]
+            line = line.set_index("depth").reindex(depths_sorted)
+            ax.plot(
+                x_values, line["score"],
+                marker="o", markersize=6, linewidth=2,
+                color=_REGION_COLORS[region], label=_REGION_LABELS[region],
+            )
+        ax.set_title(_ANALYSIS_LABELS[analysis])
+        ax.set_xlabel("depth")
+        ax.set_ylabel("score (mean across subjects)")
+        ax.set_xscale("log", base=2)
+        ax.set_xticks(x_values)
+        ax.set_xticklabels([str(v) for v in x_values])
+        ax.legend(frameon=False)
+        _style_axis(ax)
+
+    fig.suptitle(f"Score vs. depth -- epoch {epoch}")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved {out_path}")
+
+
 if __name__ == "__main__":
-    df = load_scores()
+    df = load_scores(_CHECKPOINT_DIRS)
 
     for depth in _CHECKPOINT_DIRS:
         plot_progression(df, depth, f"{depth}_progression.png")
 
     for epoch in _EPOCHS:
         plot_epoch_comparison(df, epoch, f"epoch{epoch}_comparison.png")
+
+    df_all_depths = load_scores(_ALL_CHECKPOINT_DIRS)
+    plot_depth_progression(df_all_depths, epoch=50, out_path="depth_progression_epoch50.png")
