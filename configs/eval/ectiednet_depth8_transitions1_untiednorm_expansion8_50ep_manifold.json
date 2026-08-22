@@ -1,0 +1,26 @@
+{
+  "mode": "eval",
+  "seed": 1,
+
+  "neural_dataset": "imagenet1k",
+  "analysis": "manifold",
+
+  "n_categories": 50,
+  "images_per_category": 50,
+  "panel_seed": 0,
+  "n_shots": 5,
+  "n_probes": 200,
+  "projection_dim": 2048,
+
+  "batchsize": 128,
+
+  "load_model_from": "checkpoint",
+  "checkpoint": {
+    "checkpoint_dir": "model_checkpoints/ectiednet_imagenet1k_depth8_transitions1_untiednorm_expansion8_50ep",
+    "cfg_id": 1000,
+    "checkpoint_model": "checkpoint_epoch_50.pth",
+    "return_nodes": ["iter1", "iter2", "iter3", "iter4", "iter5", "iter6", "iter7", "iter8", "embedding"]
+  },
+
+  "log_expdata": true
+}

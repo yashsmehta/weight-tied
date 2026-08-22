@@ -20,3 +20,18 @@ tqdm
 # database-connector library that happens to share the name) -- must come
 # from the actual dicarlolab repo.
 git+https://github.com/dicarlolab/CORnet.git
+
+# Manifold capacity (analysis/manifold.py, analysis="manifold" eval). Not on
+# PyPI -- this is the authors' own reference implementation of the replica
+# mean-field capacity calculation (Chung et al. 2018), imported as `mftma`.
+# mftma's own setup.py declares no dependencies at all, but it actually
+# needs all three of these (verified by import error, not documentation) --
+# autograd and cvxopt install fine at their latest versions, but pymanopt
+# MUST be pinned to the last 0.2.x release: mftma imports `pymanopt.solvers.
+# ConjugateGradient`, an API pymanopt removed in its 1.0 rewrite (current
+# pymanopt is 2.x, with solvers renamed/restructured as "optimizers") --
+# pymanopt>=1.0 breaks this import outright.
+autograd
+cvxopt
+pymanopt==0.2.5
+git+https://github.com/schung039/neural_manifolds_replicaMFT.git

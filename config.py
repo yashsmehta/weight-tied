@@ -15,7 +15,7 @@ from utils import get_seed_letter, rprint
 VALID_DATASETS = {"imagenet", "imagenet-mini-10", "imagenet-mini-50", "imagenet-mini-200"}
 VALID_MODEL_NAMES = {"AlexNet", "ECTiedNet"}
 VALID_MODEL_SOURCES = {"torchvision", "checkpoint"}
-VALID_ANALYSES = {"rsa", "encoding_score"}
+VALID_ANALYSES = {"rsa", "encoding_score", "manifold"}
 VALID_COMPARE_METHODS = {"spearman", "kendall"}
 VALID_NSD_REGIONS = {
     "early visual stream", "ventral visual stream",
@@ -113,32 +113,37 @@ def _validate_eval(cfg):
     if getattr(cfg, "seed", None) not in (1, 2, 3):
         raise AssertionError(f"Invalid seed: {cfg.get('seed')}. Must be one of [1, 2, 3]")
 
-    if cfg.neural_dataset.lower() != "nsd":
-        raise AssertionError(f"Invalid neural_dataset: {cfg.neural_dataset}. Only 'nsd' is supported")
-
-    subj = _as_list(cfg.subject_idx)
-    cfg.subject_idx = subj
-    for s in subj:
-        if not isinstance(s, int) or not 0 <= s < 8:
-            raise AssertionError(f"Invalid subject_idx for NSD: {s}. Must be an integer in [0, 7]")
-
-    region = _as_list(cfg.region)
-    cfg.region = region
-    for r in region:
-        if r not in VALID_NSD_REGIONS:
-            raise AssertionError(f"Invalid region for NSD: {r}. Must be one of {VALID_NSD_REGIONS}")
-
     if cfg.analysis.lower() not in VALID_ANALYSES:
         raise AssertionError(f"Invalid analysis: {cfg.analysis}. Must be one of {VALID_ANALYSES}")
+    analysis = cfg.analysis.lower()
 
-    if cfg.analysis.lower() == "encoding_score":
-        # Encoding metric is always Pearson r; compare_method is an RSA concept.
-        cfg.compare_method = "pearson"
+    if analysis == "manifold":
+        # No brain/NSD data involved -- intrinsic geometry of the model's own
+        # ImageNet representations, so none of the NSD-specific fields below
+        # (neural_dataset/subject_idx/region) apply.
+        cfg.compare_method = "manifold"
     else:
-        compare_method = cfg.get("compare_method", "spearman").lower()
-        if compare_method not in VALID_COMPARE_METHODS:
-            raise AssertionError(f"Invalid compare_method: {compare_method}. Must be one of {VALID_COMPARE_METHODS}")
-        cfg.compare_method = compare_method
+        if cfg.neural_dataset.lower() != "nsd":
+            raise AssertionError(f"Invalid neural_dataset: {cfg.neural_dataset}. Only 'nsd' is supported")
+        subj = _as_list(cfg.subject_idx)
+        cfg.subject_idx = subj
+        for s in subj:
+            if not isinstance(s, int) or not 0 <= s < 8:
+                raise AssertionError(f"Invalid subject_idx for NSD: {s}. Must be an integer in [0, 7]")
+        region = _as_list(cfg.region)
+        cfg.region = region
+        for r in region:
+            if r not in VALID_NSD_REGIONS:
+                raise AssertionError(f"Invalid region for NSD: {r}. Must be one of {VALID_NSD_REGIONS}")
+
+        if analysis == "encoding_score":
+            # Encoding metric is always Pearson r; compare_method is an RSA concept.
+            cfg.compare_method = "pearson"
+        else:
+            compare_method = cfg.get("compare_method", "spearman").lower()
+            if compare_method not in VALID_COMPARE_METHODS:
+                raise AssertionError(f"Invalid compare_method: {compare_method}. Must be one of {VALID_COMPARE_METHODS}")
+            cfg.compare_method = compare_method
 
     if not hasattr(cfg.return_nodes, "__iter__") or not cfg.return_nodes:
         raise AssertionError("return_nodes must be a non-empty list-like object")

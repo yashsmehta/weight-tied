@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 import torchvision
 from omegaconf import OmegaConf
+from PIL import Image
 from rich.progress import BarColumn, MofNCompleteColumn, Progress, TextColumn, TimeElapsedColumn
 
 from analysis.sparse_random_projection import get_srp_transformer
@@ -326,6 +327,71 @@ def get_activations(
             progress.advance(task)
 
     return {n: torch.cat(b, 0) for n, b in activations.items()}, ids
+
+
+def get_manifold_activations(
+    model: nn.Module,
+    image_paths: List[List[str]],
+    transform,
+    *,
+    batch_size: int,
+    device: torch.device,
+    projection_dim: int = 2048,
+    projection_seed: int = 0,
+) -> Dict[str, np.ndarray]:
+    """Extract per-layer activations for a category panel, for manifold-geometry
+    analysis (`analysis/manifold.py`).
+
+    Unlike `get_activations` (which always applies a k=4096 Sparse Random
+    Projection for the RSA/encoding pipeline), this applies one FIXED DENSE
+    Gaussian projection per layer -- A ~ N(0, 1/projection_dim), applied only
+    when a layer's native flattened width exceeds `projection_dim` -- matching
+    the manifold-analysis reference methodology exactly (every category/image
+    shares the same projection matrix per layer, so manifold geometry is
+    preserved up to that one fixed random rotation+projection). The projection
+    is applied per-batch, immediately after the forward pass, so a layer's full
+    un-projected activations across the whole panel are never materialized.
+
+    image_paths: list of lists, image_paths[c] = file paths for category c.
+    All categories must have the same image count.
+
+    Returns {layer_name: array shaped (n_categories, n_features, n_images)},
+    n_features = min(native width, projection_dim).
+    """
+    model.eval()
+    n_categories = len(image_paths)
+    n_images = len(image_paths[0])
+    flat_paths = [path for category in image_paths for path in category]
+
+    projections: Dict[str, torch.Tensor] = {}
+    layer_batches: Dict[str, List[torch.Tensor]] = defaultdict(list)
+
+    with torch.no_grad(), Progress(
+        TextColumn("  Extracting manifold activations"), BarColumn(), MofNCompleteColumn(),
+        TextColumn("batches"), TimeElapsedColumn(), console=console,
+    ) as progress:
+        n_batches = (len(flat_paths) + batch_size - 1) // batch_size
+        task = progress.add_task("extract", total=n_batches)
+        for start in range(0, len(flat_paths), batch_size):
+            batch_paths = flat_paths[start:start + batch_size]
+            imgs = torch.stack([transform(Image.open(p).convert("RGB")) for p in batch_paths]).to(device)
+            feats = model(imgs)
+            for name, out in feats.items():
+                flat = out.reshape(out.size(0), -1).float()
+                D = flat.size(1)
+                if D > projection_dim:
+                    if name not in projections:
+                        generator = torch.Generator().manual_seed(projection_seed)
+                        proj = torch.randn(D, projection_dim, generator=generator) / (projection_dim ** 0.5)
+                        projections[name] = proj.to(device)
+                    flat = flat @ projections[name]
+                layer_batches[name].append(flat.cpu())
+            progress.advance(task)
+
+    return {
+        name: torch.cat(batches, dim=0).numpy().reshape(n_categories, n_images, -1).transpose(0, 2, 1)
+        for name, batches in layer_batches.items()
+    }
 
 
 def extract_single_layer(

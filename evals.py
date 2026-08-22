@@ -12,8 +12,9 @@ from omegaconf import ListConfig, OmegaConf
 
 import model_utils as mutils
 from analysis.alignment import AlignmentData, _align_stimulus_level, compute_traintest_alignment, prepare_traintest_alignment
+from analysis.manifold import manifold_capacity, manifold_snr
 from analysis.rsa import compute_rdm, compute_rdm_correlation
-from dataloaders.imagenet import get_transform
+from dataloaders.imagenet import get_transform, sample_manifold_panel
 from dataloaders.nsd import _make_loader, load_all_nsd_data
 from results import save_results
 from utils import get_seed_letter, rprint
@@ -83,6 +84,16 @@ def eval(cfg):
         cfg.cfg_id = "pretrained" if cfg.pretrained_dataset == "imagenet1k" else "untrained"
         cfg.return_nodes = mutils.TORCHVISION_RETURN_NODES[cfg.model_name]
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if cfg.get("analysis", "rsa").lower() == "manifold":
+        # No NSD/brain data involved -- intrinsic geometry of the model's own
+        # ImageNet representations, so skip the subject/region/NSD setup below
+        # entirely rather than threading dummy values through it.
+        model = mutils.load_model(cfg, dev, verbose=verbose)
+        model = mutils.configure_feature_extractor(cfg, model, verbose=verbose)
+        results = _eval_manifold(cfg, model, dev, verbose)
+        torch.cuda.empty_cache()
+        return results
 
     subjects = _listify(cfg.subject_idx)
     regions = _listify(cfg.region)
@@ -326,3 +337,68 @@ def _eval_encoding(cfg, model, acts, ids, all_data, subjects, regions, verbose):
     torch.cuda.empty_cache()
 
     return pd.DataFrame(all_results)
+
+
+def _eval_manifold(cfg, model, dev, verbose):
+    """Manifold geometry (few-shot SNR + replica-MFT capacity, `analysis/
+    manifold.py`) over a balanced ImageNet category panel, per candidate layer.
+
+    Unlike RSA/encoding score, this has no brain/NSD data or per-subject
+    layer selection -- SNR and capacity are each computed independently for
+    EVERY candidate layer (that's the point: seeing how manifold geometry
+    changes across iter1..iterN/embedding), so one eval call can save many
+    (layer, metric) rows under a single run_id.
+    """
+    n_categories = cfg.get("n_categories", 50)
+    images_per_category = cfg.get("images_per_category", 50)
+    panel_seed = cfg.get("panel_seed", 0)
+    n_shots = cfg.get("n_shots", 5)
+    n_probes = cfg.get("n_probes", 200)
+    projection_dim = cfg.get("projection_dim", 2048)
+
+    rprint(
+        f"\n  MANIFOLD eval | cfg{cfg.get('cfg_id', '?')} epoch {cfg.get('epoch', '?')} | "
+        f"{n_categories} categories x {images_per_category} images | seed {cfg.get('seed', '?')}\n",
+        style="info",
+    )
+
+    labels, image_paths = sample_manifold_panel(
+        cfg, n_categories=n_categories, images_per_category=images_per_category, seed=panel_seed,
+    )
+    rprint(f"  Panel: {len(labels)} categories x {images_per_category} images (seed {panel_seed})", style="success")
+
+    transform = get_transform(ds_stats="imgnet")
+    manifolds = mutils.get_manifold_activations(
+        model, image_paths, transform,
+        batch_size=cfg.get("batchsize", 128), device=dev,
+        projection_dim=projection_dim, projection_seed=panel_seed,
+    )
+    rprint(f"  Activations extracted for {len(manifolds)} layers", style="success")
+
+    rows = []
+    for layer, manifold in manifolds.items():
+        n_features, n_images = manifold.shape[1], manifold.shape[2]
+
+        snr = manifold_snr(manifold, n_shots=n_shots)
+        rprint(f"    {layer:<10} | SNR (m={n_shots})  = {snr['mean']:.4f}", style="highlight")
+        rows.append({"layer": layer, "compare_method": "snr", "score": snr["mean"], "analysis": "manifold"})
+
+        if n_features <= n_images:
+            rprint(
+                f"    {layer:<10} | capacity skipped (features {n_features} <= images {n_images})",
+                style="warning",
+            )
+            continue
+        capacity = manifold_capacity(manifold, n_probes=n_probes, seed=panel_seed)
+        rprint(f"    {layer:<10} | capacity        = {capacity['mean']:.4f}", style="highlight")
+        rows.append({"layer": layer, "compare_method": "capacity", "score": capacity["mean"], "analysis": "manifold"})
+
+    results_df = pd.DataFrame(rows)
+
+    if cfg.get("log_expdata"):
+        save_results(results_df, cfg)
+
+    del model
+    torch.cuda.empty_cache()
+
+    return results_df

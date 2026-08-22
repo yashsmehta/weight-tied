@@ -6,8 +6,10 @@ tiny-imagenet and PCA-label support, neither used by this project).
 import json
 import os
 import warnings
+from collections import defaultdict
 from pathlib import Path
 
+import numpy as np
 import torch
 import torchvision.transforms as transforms
 from PIL import Image
@@ -166,6 +168,42 @@ def prepare_imgnet_data(cfg, shuffle, preprocess, train_test_split, base_path=No
 
     print(f"ImageNet: {', '.join(split_info)}")
     return datasets, loaders
+
+
+def sample_manifold_panel(cfg, n_categories=50, images_per_category=50, seed=0):
+    """Reproducible, balanced ImageNet panel for manifold-geometry analysis.
+
+    Draws n_categories classes (each with >= images_per_category images) from
+    the full label pool (no train/test split -- manifold geometry doesn't
+    involve training) and images_per_category images per class, matching the
+    sampling convention in visreps/experiments/manifold_analysis's reference
+    scripts, adapted to this project's folder_labels.json-based dataset
+    instead of a plain torchvision ImageFolder.
+
+    Returns (labels, image_paths): labels is the sorted list of selected class
+    indices, image_paths[i] is the sorted list of file paths for labels[i].
+    """
+    base_path = cfg.get("dataset_path", utils.get_env_var("IMAGENET_DATA_DIR"))
+    dataset = ImageNetDataset(base_path, split="all")
+
+    by_label = defaultdict(list)
+    for path, label, _ in dataset.samples:
+        by_label[label].append(path)
+
+    eligible = sorted(label for label, paths in by_label.items() if len(paths) >= images_per_category)
+    if len(eligible) < n_categories:
+        raise ValueError(
+            f"only {len(eligible)} ImageNet classes have >= {images_per_category} images "
+            f"(need {n_categories})"
+        )
+
+    rng = np.random.default_rng(seed)
+    labels = sorted(rng.choice(eligible, size=n_categories, replace=False).tolist())
+    image_paths = [
+        sorted(rng.choice(by_label[label], size=images_per_category, replace=False).tolist())
+        for label in labels
+    ]
+    return labels, image_paths
 
 
 def get_obj_cls_loader(cfg, shuffle=True, preprocess=True, train_test_split=True):
